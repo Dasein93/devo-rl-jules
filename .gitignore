@@ -1,4 +1,16 @@
+# Python & venv
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+
+# Artifacts (large, not in git)
 artifacts/
+*.mp4
+*.npz
+*.csv
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
