@@ -1,0 +1,19 @@
+seed: 42
+env:
+  id: mpe.simple_tag_v3
+  max_steps: 200
+  n_predators: 2
+  n_prey: 2
+train:
+  algo: ppo
+  total_episodes: 300
+  gamma: 0.99
+  lr: 3.0e-4
+  batch_size: 2048
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+logging:
+  save_dir: artifacts/
+  plot_every: 50
