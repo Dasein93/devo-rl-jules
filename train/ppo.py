@@ -1,4 +1,5 @@
 
+import os, json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 import numpy as np
@@ -45,27 +46,43 @@ class PPOConfig:
     hidden: int = 128
 
 class PPO:
-    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig):
+    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu"):
         self.cfg = cfg
-        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden)
+        self.device = device
+        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden).to(device)
         self.opt = optim.Adam(self.ac.parameters(), lr=cfg.lr)
+
+    def save(self, path, episode, returns):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            "episode": episode,
+            "returns": returns,
+            "ac_state_dict": self.ac.state_dict(),
+            "opt_state_dict": self.opt.state_dict(),
+        }, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.ac.load_state_dict(ckpt["ac_state_dict"])
+        self.opt.load_state_dict(ckpt["opt_state_dict"])
+        return ckpt["episode"], ckpt["returns"]
 
     def _compute_returns(self, rews, dones, values, gamma):
         n = len(rews); out = [0.0]*n; G = 0.0
         for i in range(n-1, -1, -1):
             G = float(rews[i]) + gamma * G * (1.0 - float(dones[i]))
             out[i] = G
-        return torch.tensor(out, dtype=torch.float32)
+        return torch.tensor(out, dtype=torch.float32).to(self.device)
 
     def update(self, obs, acts, logps, rews, dones, vals):
         n = len(rews)
         assert n>0 and len(acts)==n and len(logps)==n and len(vals)==n and len(obs)==n and len(dones)==n, \
             f"Buffer mismatch: {len(obs)=} {len(acts)=} {len(logps)=} {len(rews)=} {len(dones)=} {len(vals)=}"
         cfg = self.cfg
-        obs = torch.tensor(np.array(obs), dtype=torch.float32)
-        acts = torch.tensor(np.array(acts), dtype=torch.int64)
-        old_logps = torch.tensor(np.array(logps), dtype=torch.float32)
-        vals = torch.tensor(np.array(vals), dtype=torch.float32)
+        obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device)
+        acts = torch.tensor(np.array(acts), dtype=torch.int64).to(self.device)
+        old_logps = torch.tensor(np.array(logps), dtype=torch.float32).to(self.device)
+        vals = torch.tensor(np.array(vals), dtype=torch.float32).to(self.device)
         rets = self._compute_returns(rews, dones, vals, cfg.gamma)
         adv = (rets - vals); adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -86,6 +103,35 @@ class PPO:
                 ent = dist.entropy().mean() * cfg.ent_coef
                 loss = pg_loss + v_loss - ent
                 self.opt.zero_grad(); loss.backward(); self.opt.step()
+
+class TrajectoryRecorder:
+    def __init__(self, save_dir: str):
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.buffer = []
+
+    def record_step(self, t, agent_id, obs, act, rew, done, info):
+        self.buffer.append({
+            "t": t, "agent_id": agent_id, "obs": obs, "act": act,
+            "rew": rew, "done": done, "info": info,
+        })
+
+    def save(self, episode_id: int):
+        if not self.buffer: return
+        path_base = os.path.join(self.save_dir, f"ep_{episode_id}")
+
+        jsonl_data = []
+        obs_data, act_data = [], []
+        for step in self.buffer:
+            jsonl_data.append({k:v for k,v in step.items() if k not in ["obs","act"]})
+            obs_data.append(step["obs"])
+            act_data.append(step["act"])
+
+        with open(f"{path_base}.jsonl", "w") as f:
+            for item in jsonl_data: f.write(json.dumps(item) + "\n")
+
+        np.savez_compressed(f"{path_base}.npz", obs=np.array(obs_data), act=np.array(act_data))
+        self.buffer = []
 
 def flatten_obs(obs_in: Union[Dict[str, np.ndarray], tuple]) -> Tuple[np.ndarray, List[str]]:
     o = obs_in

@@ -17,3 +17,11 @@ train:
 logging:
   save_dir: artifacts/
   plot_every: 50
+
+device: cpu
+checkpoint:
+  enabled: true
+  every: 100
+recording:
+  enabled: true
+  sample_rate: 1
