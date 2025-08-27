@@ -44,3 +44,10 @@ Each run directory in `artifacts/` contains:
 ## Logs & Notebooks
 - Run Log: `docs/run_log.md`
 - Colab Quickstart: `notebooks/colab_quickstart.ipynb`
+
+
+## Testing
+Run the unit tests with:
+```bash
+pytest -q
+```
