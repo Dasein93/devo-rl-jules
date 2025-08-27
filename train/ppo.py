@@ -105,33 +105,53 @@ class PPO:
                 self.opt.zero_grad(); loss.backward(); self.opt.step()
 
 class TrajectoryRecorder:
-    def __init__(self, save_dir: str):
-        self.save_dir = save_dir
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.buffer = []
+    def __init__(self, save_dir: str, rec_cfg: Dict = {}):
+        self.run_dir = save_dir
+        self.sample_rate = int(rec_cfg.get("sample_rate", 1))
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.step_obs: list = []
+        self.step_acts: list = []
+        self.buffer: list = []
 
     def record_step(self, t, agent_id, obs, act, rew, done, info):
+        # For JSONL
         self.buffer.append({
-            "t": t, "agent_id": agent_id, "obs": obs, "act": act,
+            "t": t, "agent_id": agent_id, "obs": obs.tolist(), "act": act,
             "rew": rew, "done": done, "info": info,
         })
+        # For NPZ
+        self.step_obs.append(obs)
+        self.step_acts.append(act)
 
-    def save(self, episode_id: int):
+    def _pad_and_stack(self, obs_list):
+        import numpy as np
+        max_len = max(int(np.size(o)) for o in obs_list)
+        padded = []
+        for o in obs_list:
+            a = np.asarray(o, dtype=np.float32).ravel()
+            if a.size < max_len:
+                a = np.concatenate([a, np.zeros(max_len - a.size, dtype=np.float32)], axis=0)
+            padded.append(a)
+        return np.stack(padded, axis=0).astype(np.float32)
+
+    def save(self, episode_idx: int):
         if not self.buffer: return
-        path_base = os.path.join(self.save_dir, f"ep_{episode_id}")
 
-        jsonl_data = []
-        obs_data, act_data = [], []
-        for step in self.buffer:
-            jsonl_data.append({k:v for k,v in step.items() if k not in ["obs","act"]})
-            obs_data.append(step["obs"])
-            act_data.append(step["act"])
+        path_base = os.path.join(self.run_dir, f"ep_{episode_idx}")
 
+        # JSONL
         with open(f"{path_base}.jsonl", "w") as f:
-            for item in jsonl_data: f.write(json.dumps(item) + "\n")
+            for item in self.buffer: f.write(json.dumps(item) + "\n")
 
-        np.savez_compressed(f"{path_base}.npz", obs=np.array(obs_data), act=np.array(act_data))
-        self.buffer = []
+        # NPZ
+        obs_mat = self._pad_and_stack(self.step_obs)
+        act_vec = np.array(self.step_acts, dtype=np.int64)
+        np.savez_compressed(f"{path_base}.npz", obs=obs_mat, act=act_vec)
+
+        # Clear buffers
+        self.buffer.clear()
+        self.step_obs.clear()
+        self.step_acts.clear()
 
 def flatten_obs(obs_in: Union[Dict[str, np.ndarray], tuple]) -> Tuple[np.ndarray, List[str]]:
     o = obs_in
