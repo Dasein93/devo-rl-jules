@@ -53,15 +53,22 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         run_id = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M")
         out_dir = os.path.join(save_dir or cfg.get("logging",{}).get("save_dir","artifacts/"), run_id)
 
+    
     plots_dir = os.path.join(out_dir, "plots"); ensure_dir(plots_dir)
     checkpoints_dir = os.path.join(out_dir, "checkpoints"); ensure_dir(checkpoints_dir)
-
+    
+    from train.ppo import TrajectoryRecorder
+    
     recorder = None
-    rec_cfg = cfg.get("recording",{})
-    if rec_cfg.get("enabled",False):
-        replays_dir = os.path.join(out_dir, "replays"); ensure_dir(replays_dir)
-        recorder = TrajectoryRecorder(replays_dir, rec_cfg)
-
+    rec_cfg = cfg.get("recording", {})
+    if rec_cfg.get("enabled", False):
+        traj_dir = os.path.join(out_dir, "traj")
+        ensure_dir(traj_dir)
+        recorder = TrajectoryRecorder(
+            save_dir=traj_dir,
+            sample_rate=int(rec_cfg.get("sample_rate", 1))
+        )
+    
     env = make_env(n_predators=n_pred, n_prey=n_ev, max_cycles=max_steps, seed=seed)
     obs0 = _reset(env, seed=seed)
     obs_arr, agents = flatten_obs(obs0)
