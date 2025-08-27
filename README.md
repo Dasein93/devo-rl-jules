@@ -34,6 +34,13 @@ python tools/replay.py artifacts/run_YYYYMMDD_HHMM/replays/ep_1.jsonl
 ```
 Note: `imageio` requires `ffmpeg` to be installed for saving MP4 files.
 
+## Artifacts
+Each run directory in `artifacts/` contains:
+- `checkpoints/`: Model checkpoints (`.pt`).
+- `plots/`: Training curve plots (`.png`).
+- `replays/`: Per-episode trajectory logs. `trajectory.jsonl` (stepwise logs) + `trajectory.npz` (padded arrays) enable replays and analysis. Observations are padded to the longest vector in the run.
+- `metrics.csv`: CSV log of per-episode returns.
+
 ## Logs & Notebooks
 - Run Log: `docs/run_log.md`
 - Colab Quickstart: `notebooks/colab_quickstart.ipynb`

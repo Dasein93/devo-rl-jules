@@ -57,9 +57,10 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
     checkpoints_dir = os.path.join(out_dir, "checkpoints"); ensure_dir(checkpoints_dir)
 
     recorder = None
-    if cfg.get("recording",{}).get("enabled",False):
+    rec_cfg = cfg.get("recording",{})
+    if rec_cfg.get("enabled",False):
         replays_dir = os.path.join(out_dir, "replays"); ensure_dir(replays_dir)
-        recorder = TrajectoryRecorder(replays_dir)
+        recorder = TrajectoryRecorder(replays_dir, rec_cfg)
 
     env = make_env(n_predators=n_pred, n_prey=n_ev, max_cycles=max_steps, seed=seed)
     obs0 = _reset(env, seed=seed)
@@ -100,7 +101,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             acts = {agent:int(a[i].item()) for i,agent in enumerate(agents)}
             next_obs, rewards, done_any, infos = _step(env, acts)
 
-            if recorder and ep % cfg["recording"].get("sample_rate",1) == 0:
+            if recorder and t % recorder.sample_rate == 0:
                 for i,agent_id in enumerate(agents):
                     recorder.record_step(t, agent_id, obs[agent_id], acts[agent_id], rewards[agent_id], done_any, infos[agent_id])
 
