@@ -59,19 +59,31 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
     
     from train.ppo import TrajectoryRecorder
     
+    env = make_env(n_predators=n_pred, n_prey=n_ev, max_cycles=max_steps, seed=seed)
+    obs0 = _reset(env, seed=seed)
+    obs_arr, agents = flatten_obs(obs0)
+
     recorder = None
     rec_cfg = cfg.get("recording", {})
     if rec_cfg.get("enabled", False):
         traj_dir = os.path.join(out_dir, "traj")
         ensure_dir(traj_dir)
+
+        env_record_cfg = {
+            "num_adversaries": n_pred,
+            "num_good": n_ev,
+            "max_cycles": max_steps,
+            "continuous_actions": False, # hardcoded based on env
+        }
+
         recorder = TrajectoryRecorder(
             save_dir=traj_dir,
-            sample_rate=int(rec_cfg.get("sample_rate", 1))
+            env_id=cfg.get("env",{}).get("id", "mpe.simple_tag_v3"),
+            env_cfg=env_record_cfg,
+            global_seed=seed,
+            agent_names=agents,
+            rec_cfg=rec_cfg,
         )
-    
-    env = make_env(n_predators=n_pred, n_prey=n_ev, max_cycles=max_steps, seed=seed)
-    obs0 = _reset(env, seed=seed)
-    obs_arr, agents = flatten_obs(obs0)
     obs_dim = obs_arr.shape[1]; act_dim = env.action_space(agents[0]).n; n_agents = len(agents)
 
     ppo_cfg = PPOConfig(
@@ -121,7 +133,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             S["dones"].append(float(done_any))
             ep_ret += sum(rewards.values()); obs = next_obs; t+=1
 
-        if recorder: recorder.save(ep)
+        if recorder: recorder.save(ep, episode_seed=(seed+ep))
         n_total = len(S["acts"]); n_steps = len(S["rews"])
         rep = max(1, n_total//max(1,n_steps))
         if n_total != n_steps:
@@ -149,6 +161,10 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             ckpt_path = os.path.join(checkpoints_dir, f"ckpt_{ep}.pt")
             ppo.save(ckpt_path, ep, returns)
             print("Saved checkpoint:", ckpt_path)
+
+    if recorder:
+        recorder.save_manifest()
+        print("Saved manifest:", os.path.join(recorder.run_dir, "manifest.json"))
 
     print("Saved:", metrics_path, "and", os.path.join(plots_dir,"return.png"))
 
