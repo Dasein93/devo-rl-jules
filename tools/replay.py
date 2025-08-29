@@ -61,12 +61,29 @@ def _load_obs(npz_path: str) -> np.ndarray:
     return arr  # (T, A, D)
 
 
-def _load_actions(npz_path: str) -> np.ndarray:
-    """Load actions from a .npz file."""
+def _load_positions_and_names(npz_path: str) -> Tuple[np.ndarray, List[str]]:
+    """
+    Load positions and agent_names from a .npz file.
+    Returns:
+        (pos, agent_names)
+        pos: np.ndarray of shape (T, A, 2)
+        agent_names: list of strings
+    """
     with np.load(npz_path, allow_pickle=True) as data:
-        if "act" in data:
-            return np.asarray(data["act"])
-        raise ValueError(f"No action key 'act' found in {npz_path}.")
+        if "pos" not in data:
+            raise ValueError(f"No position key 'pos' found in {npz_path}.")
+        if "agent_names" not in data:
+            raise ValueError(f"No agent_names key found in {npz_path}.")
+
+        pos = np.asarray(data["pos"])
+        names = list(data["agent_names"])
+
+        if pos.ndim != 3 or pos.shape[2] != 2:
+            raise ValueError(f"Expected pos shape (T,A,2), got {pos.shape}")
+        if len(names) != pos.shape[1]:
+            raise ValueError(f"Agent name/position mismatch: {len(names)} vs {pos.shape[1]}")
+
+        return pos, names
 
 
 def _normalize_for_visual(obs_t: np.ndarray) -> np.ndarray:
@@ -135,60 +152,38 @@ def _render_episode_heatmap(
 
 
 def _render_episode_positions(
-    manifest: dict,
-    npz_path: str,
+    positions: np.ndarray,
+    agent_names: List[str],
     writer: imageio.FFMPEGWriter,
-    episode_idx: int,
-    total_episodes: int,
+    title_prefix: str = "",
     dpi: int = 120,
     frameskip: int = 1,
-    speed: float = 1.0,
 ) -> None:
     """Render one episode as a 2D scatter plot of agent positions."""
-    from pettingzoo.mpe import simple_tag_v3
-
-    # Load data
-    actions = _load_actions(npz_path)
-    ep_seed = manifest["episode_seeds"][episode_idx - 1]
-    env_cfg = manifest["env_cfg"]
-    agent_names = manifest["agent_names"]
-    n_preds = env_cfg.get("num_adversaries", 0)
-
-    # Re-create env
-    env = simple_tag_v3.parallel_env(render_mode=None, **env_cfg)
-    env.reset(seed=ep_seed)
-
-    # Setup plot
+    T, A, _ = positions.shape
     fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
-    world_bounds = [-1.1, 1.1]
+    world_bounds = [np.min(positions) - 0.1, np.max(positions) + 0.1]
 
-    T = actions.shape[0]
+    predator_indices = [i for i, name in enumerate(agent_names) if "adversary" in name]
+    prey_indices = [i for i, name in enumerate(agent_names) if "adversary" not in name]
+
     for t in range(0, T, frameskip):
-        # Apply actions and get positions
-        env.step({agent: act for agent, act in zip(agent_names, actions[t])})
-
-        positions = []
-        # env.aec_env.unwrapped.world.agents is the list of agents in order
-        for agent_obj in env.aec_env.unwrapped.world.agents:
-            positions.append(agent_obj.state.p_pos)
-        positions = np.array(positions)
-
-        # Render frame
         ax.clear()
         ax.set_xlim(world_bounds)
         ax.set_ylim(world_bounds)
         ax.set_aspect("equal")
-        ax.set_title(f"Episode {episode_idx}/{total_episodes}, t={t*speed:.1f}s (step {t})", fontsize=10)
+        ax.set_title(f"{title_prefix}t={t}", fontsize=10)
 
-        # Predators (red)
-        ax.scatter(positions[:n_preds, 0], positions[:n_preds, 1], c='r', label="Predators", s=100)
-        # Prey (green)
-        ax.scatter(positions[n_preds:, 0], positions[n_preds:, 1], c='g', label="Prey", s=100)
+        # Predators (red) vs Prey (green)
+        pos_t = positions[t]
+        if predator_indices:
+            ax.scatter(pos_t[predator_indices, 0], pos_t[predator_indices, 1], c='r', label="Predators", s=100)
+        if prey_indices:
+            ax.scatter(pos_t[prey_indices, 0], pos_t[prey_indices, 1], c='g', label="Prey", s=100)
 
         if t == 0: ax.legend(loc="upper right", fontsize=8)
-        fig.tight_layout()
 
-        # Convert to frame and write
+        # No fig.tight_layout() for speed
         fig.canvas.draw()
         rgba_buf = fig.canvas.buffer_rgba()
         w, h = fig.canvas.get_width_height()
@@ -208,7 +203,6 @@ def make_video(
     fps: int,
     mode: str = "heatmap",
     dpi: int = 120,
-    speed: float = 1.0,
     frameskip: int = 1,
 ) -> Tuple[int, List[str]]:
     """
@@ -221,17 +215,6 @@ def make_video(
     if not npz_files:
         raise FileNotFoundError(f"No .npz files found at: {trajectory_path}")
 
-    # Check for manifest if in positions mode
-    manifest_path = os.path.join(os.path.dirname(npz_files[0]), "manifest.json")
-    manifest = None
-    if mode == "positions":
-        if os.path.exists(manifest_path):
-            with open(manifest_path, "r") as f:
-                manifest = json.load(f)
-        else:
-            print(f"⚠️  Warning: manifest.json not found in {os.path.dirname(npz_files[0])}. Falling back to heatmap mode.")
-            mode = "heatmap"
-
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
     writer = imageio.get_writer(out_mp4, fps=fps, codec="libx264", bitrate="8000k", quality=8)
     used = []
@@ -239,9 +222,14 @@ def make_video(
     try:
         for idx, f in enumerate(npz_files, start=1):
             title = f"Episode {idx}/{len(npz_files)} — {os.path.basename(f)} "
-            if mode == "positions" and manifest:
-                _render_episode_positions(manifest, f, writer, idx, len(npz_files), dpi, frameskip, speed)
-            else:
+            if mode == "positions":
+                try:
+                    positions, agent_names = _load_positions_and_names(f)
+                    _render_episode_positions(positions, agent_names, writer, title_prefix=title, dpi=dpi, frameskip=frameskip)
+                except ValueError as e:
+                    print(f"⚠️  Skipping {f} for position replay: {e}")
+                    continue
+            else: # heatmap
                 obs = _load_obs(f)  # (T, A, D)
                 _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title)
             used.append(f)
@@ -258,10 +246,7 @@ def main():
     parser.add_argument("--fps", type=int, default=12, help="Frames per second")
     parser.add_argument("--mode", type=str, choices=["heatmap", "positions"], default="heatmap",
                         help="Replay mode: 'heatmap' for obs, 'positions' for 2D scatter")
-    parser.add_argument("--env_id", type=str, default="mpe.simple_tag_v3",
-                        help="PettingZoo env id for position replay")
     parser.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames")
-    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
     parser.add_argument("--frameskip", type=int, default=1, help="Render 1 of N frames")
     args = parser.parse_args()
 
@@ -278,7 +263,6 @@ def main():
             args.fps,
             mode=args.mode,
             dpi=args.dpi,
-            speed=args.speed,
             frameskip=args.frameskip,
         )
     except Exception as e:

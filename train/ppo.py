@@ -111,6 +111,7 @@ class TrajectoryRecorder:
         os.makedirs(self.run_dir, exist_ok=True)
         self.step_obs: list = []
         self.step_acts: list = []
+        self.step_pos: list = []
         self.buffer: list = []
 
         self.env_id = env_id
@@ -128,6 +129,13 @@ class TrajectoryRecorder:
         # For NPZ
         self.step_obs.append(obs)
         self.step_acts.append(act)
+
+    def record_step_positions(self, obs_dict: Dict[str, np.ndarray]):
+        if "simple_tag" not in self.env_id: return
+        # obs_dict is {agent_id: obs_vec}
+        # self.agent_names is sorted, so we must iterate in that order
+        for agent_id in self.agent_names:
+            self.step_pos.append(obs_dict[agent_id][2:4])
 
     def _pad_and_stack(self, obs_list):
         import numpy as np
@@ -151,26 +159,34 @@ class TrajectoryRecorder:
             for item in self.buffer: f.write(json.dumps(item) + "\n")
 
         # NPZ
-        obs_mat = self._pad_and_stack(self.step_obs)
-
-        # Reshape actions to (T, A)
         n_agents = len(self.agent_names)
+        obs_mat = self._pad_and_stack(self.step_obs)
         act_mat = np.array(self.step_acts, dtype=np.int64).reshape(-1, n_agents)
 
-        np.savez_compressed(f"{path_base}.npz", obs=obs_mat, act=act_mat)
+        save_payload = {"obs": obs_mat, "act": act_mat, "agent_names": self.agent_names}
+
+        if self.step_pos:
+            pos_mat = np.array(self.step_pos, dtype=np.float32).reshape(-1, n_agents, 2)
+            save_payload["pos"] = pos_mat
+
+        np.savez_compressed(f"{path_base}.npz", **save_payload)
 
         # Clear buffers
         self.buffer.clear()
         self.step_obs.clear()
         self.step_acts.clear()
+        self.step_pos.clear()
 
     def save_manifest(self):
+        # NOTE: we save one manifest.json, not manifest.jsonl
+        agent_roles = ["predator" if "adversary" in name else "prey" for name in self.agent_names]
         manifest = {
             "env_id": self.env_id,
             "env_cfg": self.env_cfg,
             "global_seed": self.global_seed,
             "episode_seeds": self.episode_seeds,
             "agent_names": self.agent_names,
+            "agent_roles": agent_roles,
         }
         with open(os.path.join(self.run_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)

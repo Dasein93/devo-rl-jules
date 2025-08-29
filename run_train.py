@@ -123,6 +123,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             if recorder and t % recorder.sample_rate == 0:
                 for i,agent_id in enumerate(agents):
                     recorder.record_step(t, agent_id, obs[agent_id], acts[agent_id], rewards[agent_id], done_any, infos[agent_id])
+                recorder.record_step_positions(obs)
 
             avg_r = float(np.mean(list(rewards.values())))
             S["obs"].extend(obs_t)
