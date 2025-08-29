@@ -108,9 +108,13 @@ class TrajectoryRecorder:
     def __init__(self, save_dir: str, env_id: str, env_cfg: dict, global_seed: int, agent_names: list, rec_cfg: Dict = {}):
         self.run_dir = save_dir
         self.sample_rate = int(rec_cfg.get("sample_rate", 1))
+        self.pos_xy_idx = rec_cfg.get("pos_xy_idx", None)
+        if self.pos_xy_idx:
+            assert len(self.pos_xy_idx) == 2, "pos_xy_idx must be a list of two integers"
         os.makedirs(self.run_dir, exist_ok=True)
         self.step_obs: list = []
         self.step_acts: list = []
+        self.step_pos: list = []
         self.buffer: list = []
 
         self.env_id = env_id
@@ -128,6 +132,9 @@ class TrajectoryRecorder:
         # For NPZ
         self.step_obs.append(obs)
         self.step_acts.append(act)
+        if self.pos_xy_idx:
+            start, end = self.pos_xy_idx
+            self.step_pos.append(obs[start:end])
 
     def _pad_and_stack(self, obs_list):
         import numpy as np
@@ -156,13 +163,30 @@ class TrajectoryRecorder:
         # Reshape actions to (T, A)
         n_agents = len(self.agent_names)
         act_mat = np.array(self.step_acts, dtype=np.int64).reshape(-1, n_agents)
+        T = act_mat.shape[0]
 
-        np.savez_compressed(f"{path_base}.npz", obs=obs_mat, act=act_mat)
+        save_payload = {"obs": obs_mat, "act": act_mat, "agent_names": self.agent_names}
+        if self.pos_xy_idx:
+            pos_mat = np.array(self.step_pos, dtype=np.float32).reshape(T, n_agents, -1)
+            assert pos_mat.shape[2] == self.pos_xy_idx[1] - self.pos_xy_idx[0]
+            save_payload["pos"] = pos_mat
+
+        np.savez_compressed(f"{path_base}.npz", **save_payload)
+
+        # Write manifest.jsonl
+        manifest_path = os.path.join(self.run_dir, "manifest.jsonl")
+        with open(manifest_path, "a") as f:
+            f.write(json.dumps({
+                "episode": episode_idx,
+                "n_steps": T,
+                "agent_names": self.agent_names,
+            }) + "\n")
 
         # Clear buffers
         self.buffer.clear()
         self.step_obs.clear()
         self.step_acts.clear()
+        self.step_pos.clear()
 
     def save_manifest(self):
         manifest = {

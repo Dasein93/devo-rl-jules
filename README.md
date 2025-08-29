@@ -34,14 +34,30 @@ The default replay mode visualizes agent observations as a feature heatmap. This
 python tools/replay.py --in artifacts/run_2025*/traj --out artifacts/latest_heatmap.mp4 --mode heatmap
 ```
 
-### Replays (Positions)
-A new replay mode renders the actual 2D positions of agents (predators in red, prey in green) by reconstructing the environment state from recorded actions. This provides a much more intuitive view of the episode.
+### Trajectory Recording
+To record trajectories, enable the `recording` section in your config file.
 
-**1. Record during training:**
-This is enabled by default in `configs/base.yaml`. A `manifest.json` is saved into the trajectory folder.
-```bash
-python run_train.py --config configs/base.yaml --episodes 50
+```yaml
+recording:
+  enabled: True
+  sample_rate: 1 # Record every Nth episode
+  # To record 2D positions for scatter plot replay
+  pos_xy_idx: [2, 4] # Slice of the observation vector [start, end)
 ```
+
+The recorded data is saved in the `traj/` directory of your run. Each episode is saved as a `.npz` file containing:
+- `obs`: The observation vectors.
+- `act`: The actions taken by the agents.
+- `pos`: The (x, y) positions of the agents (if `pos_xy_idx` is set).
+- `agent_names`: The names of the agents.
+
+A `manifest.jsonl` file is also created, containing metadata for each episode.
+
+### Replays (Positions)
+A new, fast replay mode renders the 2D positions of agents directly from the recorded `.npz` files. This is much faster than the old method of re-simulating the environment.
+
+**1. Record trajectories with position data:**
+Make sure `recording.pos_xy_idx` is set in your config, as described above.
 
 **2. Render positions from the latest run:**
 ```bash
@@ -51,16 +67,14 @@ LATEST_RUN=$(ls -d artifacts/run_* | tail -n 1)
 # render
 python tools/replay.py --in $LATEST_RUN/traj \
   --out artifacts/latest_replay.mp4 \
-  --mode positions --fps 12
+  --mode positions --fps 24
 ```
 
-If `manifest.json` is missing, the replay tool will print a warning and fall back to heatmap mode.
+The replay tool will automatically detect the presence of `pos` data in the `.npz` files. If it's not found, it will fall back to the heatmap mode. Predators (named "adversary*") are colored red, and prey (named "agent*") are colored blue.
 
 **Additional flags:**
 - `--fps`: Frames per second for the output video.
-- `--frameskip`: Render every Nth frame to speed up video generation.
 - `--dpi`: Resolution of the video.
-- `--speed`: Adjust the playback speed in the title.
 
 ## Artifacts
 Each run directory in `artifacts/` contains:

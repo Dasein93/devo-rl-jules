@@ -134,69 +134,53 @@ def _render_episode_heatmap(
     plt.close(fig)
 
 
-def _render_episode_positions(
-    manifest: dict,
-    npz_path: str,
-    writer: imageio.FFMPEGWriter,
-    episode_idx: int,
-    total_episodes: int,
+def _render_episode_positions_from_npz(
+    pos: np.ndarray,
+    agent_names: List[str],
+    writer: imageio.FFMPEG.Writer,
+    title_prefix: str = "",
     dpi: int = 120,
-    frameskip: int = 1,
-    speed: float = 1.0,
 ) -> None:
-    """Render one episode as a 2D scatter plot of agent positions."""
-    from pettingzoo.mpe import simple_tag_v3
+    """Render one episode as a 2D scatter plot of agent positions from NPZ."""
+    T, A, D = pos.shape
+    assert D == 2, f"Position data must be 2D, but got {D} dimensions"
 
-    # Load data
-    actions = _load_actions(npz_path)
-    ep_seed = manifest["episode_seeds"][episode_idx - 1]
-    env_cfg = manifest["env_cfg"]
-    agent_names = manifest["agent_names"]
-    n_preds = env_cfg.get("num_adversaries", 0)
-
-    # Re-create env
-    env = simple_tag_v3.parallel_env(render_mode=None, **env_cfg)
-    env.reset(seed=ep_seed)
+    # Determine team colors
+    adversary_indices = [i for i, name in enumerate(agent_names) if "adversary" in name]
+    agent_indices = [i for i, name in enumerate(agent_names) if "agent" in name]
 
     # Setup plot
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
-    world_bounds = [-1.1, 1.1]
+    fig, ax = plt.subplots(figsize=(7.2, 7.2), dpi=100) # 720x720 pixels
+    world_bounds = np.array([pos.min(axis=(0,1)), pos.max(axis=(0,1))])
+    world_size = world_bounds[1] - world_bounds[0]
+    world_center = world_bounds[0] + world_size / 2
+    max_range = world_size.max() * 1.1
 
-    T = actions.shape[0]
-    for t in range(0, T, frameskip):
-        # Apply actions and get positions
-        env.step({agent: act for agent, act in zip(agent_names, actions[t])})
-
-        positions = []
-        # env.aec_env.unwrapped.world.agents is the list of agents in order
-        for agent_obj in env.aec_env.unwrapped.world.agents:
-            positions.append(agent_obj.state.p_pos)
-        positions = np.array(positions)
-
-        # Render frame
+    for t in range(T):
         ax.clear()
-        ax.set_xlim(world_bounds)
-        ax.set_ylim(world_bounds)
+        ax.set_xlim(world_center[0] - max_range / 2, world_center[0] + max_range / 2)
+        ax.set_ylim(world_center[1] - max_range / 2, world_center[1] + max_range / 2)
         ax.set_aspect("equal")
-        ax.set_title(f"Episode {episode_idx}/{total_episodes}, t={t*speed:.1f}s (step {t})", fontsize=10)
+        ax.set_title(f"{title_prefix}t={t}", fontsize=10)
 
-        # Predators (red)
-        ax.scatter(positions[:n_preds, 0], positions[:n_preds, 1], c='r', label="Predators", s=100)
-        # Prey (green)
-        ax.scatter(positions[n_preds:, 0], positions[n_preds:, 1], c='g', label="Prey", s=100)
+        # Plot adversaries (e.g., predators)
+        if adversary_indices:
+            adv_pos = pos[t, adversary_indices, :]
+            ax.scatter(adv_pos[:, 0], adv_pos[:, 1], c="tab:red", label="Adversaries", s=100)
 
-        if t == 0: ax.legend(loc="upper right", fontsize=8)
-        fig.tight_layout()
+        # Plot agents (e.g., prey)
+        if agent_indices:
+            agent_pos = pos[t, agent_indices, :]
+            ax.scatter(agent_pos[:, 0], agent_pos[:, 1], c="tab:blue", label="Agents", s=100)
+
+        if t == 0:
+            ax.legend(loc="upper right", fontsize=8)
 
         # Convert to frame and write
         fig.canvas.draw()
         rgba_buf = fig.canvas.buffer_rgba()
         w, h = fig.canvas.get_width_height()
         frame_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
-        if w % 16 != 0 or h % 16 != 0:
-             w = (w // 16) * 16
-             h = (h // 16) * 16
-             frame_img = frame_img[:h, :w, :]
         writer.append_data(frame_img)
 
     plt.close(fig)
@@ -208,8 +192,6 @@ def make_video(
     fps: int,
     mode: str = "heatmap",
     dpi: int = 120,
-    speed: float = 1.0,
-    frameskip: int = 1,
 ) -> Tuple[int, List[str]]:
     """
     Create an MP4 from a trajectory folder or single .npz.
@@ -221,29 +203,27 @@ def make_video(
     if not npz_files:
         raise FileNotFoundError(f"No .npz files found at: {trajectory_path}")
 
-    # Check for manifest if in positions mode
-    manifest_path = os.path.join(os.path.dirname(npz_files[0]), "manifest.json")
-    manifest = None
-    if mode == "positions":
-        if os.path.exists(manifest_path):
-            with open(manifest_path, "r") as f:
-                manifest = json.load(f)
-        else:
-            print(f"⚠️  Warning: manifest.json not found in {os.path.dirname(npz_files[0])}. Falling back to heatmap mode.")
-            mode = "heatmap"
-
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
     writer = imageio.get_writer(out_mp4, fps=fps, codec="libx264", bitrate="8000k", quality=8)
     used = []
 
     try:
         for idx, f in enumerate(npz_files, start=1):
-            title = f"Episode {idx}/{len(npz_files)} — {os.path.basename(f)} "
-            if mode == "positions" and manifest:
-                _render_episode_positions(manifest, f, writer, idx, len(npz_files), dpi, frameskip, speed)
+            title_prefix = f"Ep {idx}/{len(npz_files)} — {os.path.basename(f)} "
+
+            if mode == "positions":
+                with np.load(f, allow_pickle=True) as data:
+                    if "pos" in data and "agent_names" in data:
+                        pos = data["pos"]
+                        agent_names = data["agent_names"].tolist()
+                        _render_episode_positions_from_npz(pos, agent_names, writer, title_prefix, dpi)
+                    else:
+                        print(f"⚠️  Warning: 'pos' or 'agent_names' not in {f}. Falling back to heatmap.")
+                        obs = _load_obs(f)
+                        _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title_prefix)
             else:
-                obs = _load_obs(f)  # (T, A, D)
-                _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title)
+                obs = _load_obs(f)
+                _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title_prefix)
             used.append(f)
     finally:
         writer.close()
@@ -261,8 +241,6 @@ def main():
     parser.add_argument("--env_id", type=str, default="mpe.simple_tag_v3",
                         help="PettingZoo env id for position replay")
     parser.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames")
-    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
-    parser.add_argument("--frameskip", type=int, default=1, help="Render 1 of N frames")
     args = parser.parse_args()
 
     # Rename 'in' to 'trajectory_path' for clarity
@@ -278,8 +256,6 @@ def main():
             args.fps,
             mode=args.mode,
             dpi=args.dpi,
-            speed=args.speed,
-            frameskip=args.frameskip,
         )
     except Exception as e:
         print(f"[replay] ERROR: {e}")

@@ -1,79 +1,83 @@
 import os
-import json
+import shutil
+import yaml
 import numpy as np
-import pytest
-from tools.replay import make_video
+import glob
+from run_train import main as run_train_main
+from tools.replay import main as replay_main
 
-@pytest.fixture
-def dummy_trajectory(tmp_path):
-    traj_dir = tmp_path / "traj"
-    traj_dir.mkdir()
-
-    # Create manifest.json
-    manifest = {
-        "env_id": "mpe.simple_tag_v3",
-        "env_cfg": {
-            "num_adversaries": 1,
-            "num_good": 1,
-            "max_cycles": 25,
-            "continuous_actions": False,
+def test_record_and_replay_positions(tmpdir):
+    # 1. Create a temporary config file for a tiny run
+    config = {
+        'seed': 42,
+        'device': 'cpu',
+        'env': {
+            'id': 'mpe.simple_tag_v3',
+            'max_steps': 20,
+            'n_predators': 2,
+            'n_prey': 2,
         },
-        "global_seed": 42,
-        "episode_seeds": [42, 43],
-        "agent_names": ["adversary_0", "agent_0"],
+        'train': {
+            'total_episodes': 1,
+            'lr': 1e-4,
+        },
+        'checkpoint': {'enabled': False},
+        'recording': {
+            'enabled': True,
+            'sample_rate': 1,
+            'pos_xy_idx': [2, 4], # For simple_tag_v3, obs[2:4] is agent's position
+        },
+        'logging': {}
     }
-    with open(traj_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f)
+    config_path = os.path.join(tmpdir, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
 
-    # Create a dummy trajectory file
-    ep1_path = traj_dir / "ep_1.npz"
-    actions = np.random.randint(0, 5, size=(10, 2))  # 10 steps, 2 agents
-    np.savez_compressed(ep1_path, act=actions, obs=np.zeros((10, 2, 10)))
+    # 2. Run training for 1 episode to generate a trajectory
+    save_dir = os.path.join(tmpdir, "artifacts")
+    run_train_main(config_path, override_eps=1, save_dir=save_dir, device='cpu')
 
-    return str(traj_dir)
+    # 3. Verify the trajectory file and its contents
+    run_dirs = [d for d in os.listdir(save_dir) if d.startswith('run_')]
+    assert len(run_dirs) == 1, "Expected exactly one run directory"
+    run_dir = os.path.join(save_dir, run_dirs[0])
+    traj_dir = os.path.join(run_dir, "traj")
+    assert os.path.isdir(traj_dir)
 
-def test_make_video_positions_mode(dummy_trajectory, tmp_path):
-    """
-    Test that make_video in 'positions' mode creates a non-empty MP4 file.
-    """
-    output_mp4 = tmp_path / "replay.mp4"
+    # Check for the episode npz file
+    npz_files = glob.glob(os.path.join(traj_dir, "ep_*.npz"))
+    assert len(npz_files) == 1, "Expected one episode .npz file"
+    traj_path = npz_files[0]
 
+    # Load the trajectory and check for 'pos' and 'agent_names'
+    data = np.load(traj_path)
+    assert "pos" in data, "Trajectory file must contain 'pos' data"
+    assert "agent_names" in data, "Trajectory file must contain 'agent_names' data"
+
+    pos = data["pos"]
+    agent_names = data["agent_names"]
+    n_agents = config['env']['n_predators'] + config['env']['n_prey']
+    assert pos.shape[1] == n_agents, f"pos shape {pos.shape} has wrong number of agents"
+    assert pos.shape[2] == 2, f"pos should be 2D (x,y), but shape is {pos.shape}"
+    assert len(agent_names) == n_agents
+
+    # Check for manifest.jsonl
+    manifest_path = os.path.join(traj_dir, "manifest.jsonl")
+    assert os.path.exists(manifest_path), "manifest.jsonl was not created"
+    with open(manifest_path, "r") as f:
+        lines = f.readlines()
+        assert len(lines) == 1, "manifest.jsonl should have one line for one episode"
+
+    # 4. Run replay in 'positions' mode and check for MP4 output
+    replay_out_path = os.path.join(tmpdir, "replay.mp4")
+
+    import sys
+    original_argv = sys.argv
+    sys.argv = ["replay.py", traj_dir, "--out", replay_out_path, "--mode", "positions"]
     try:
-        n, used = make_video(
-            trajectory_path=dummy_trajectory,
-            out_mp4=str(output_mp4),
-            fps=10,
-            mode="positions",
-            frameskip=5, # speed up test
-        )
-    except ImportError as e:
-        pytest.skip(f"Skipping replay test, missing dependency: {e}")
+        replay_main()
+    finally:
+        sys.argv = original_argv
 
-
-    assert n == 1
-    assert os.path.exists(output_mp4)
-    assert os.path.getsize(output_mp4) > 0
-
-def test_make_video_fallback_to_heatmap(dummy_trajectory, tmp_path, capsys):
-    """
-    Test that make_video falls back to heatmap mode if manifest is missing.
-    """
-    output_mp4 = tmp_path / "replay_heatmap.mp4"
-
-    # Remove manifest to trigger fallback
-    os.remove(os.path.join(dummy_trajectory, "manifest.json"))
-
-    n, used = make_video(
-        trajectory_path=dummy_trajectory,
-        out_mp4=str(output_mp4),
-        fps=10,
-        mode="positions", # request positions
-    )
-
-    assert n == 1
-    assert os.path.exists(output_mp4)
-    assert os.path.getsize(output_mp4) > 0
-
-    captured = capsys.readouterr()
-    assert "Warning: manifest.json not found" in captured.out
-    assert "Falling back to heatmap mode" in captured.out
+    assert os.path.exists(replay_out_path), "Replay script did not create the mp4 file"
+    assert os.path.getsize(replay_out_path) > 1000, "Replay mp4 file is too small"
