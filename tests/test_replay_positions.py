@@ -44,7 +44,7 @@ def test_make_video_positions_mode(dummy_trajectory, tmp_path):
             out_mp4=str(output_mp4),
             fps=10,
             mode="positions",
-            frameskip=5, # speed up test
+            frame_stride=5, # speed up test
         )
     except ImportError as e:
         pytest.skip(f"Skipping replay test, missing dependency: {e}")

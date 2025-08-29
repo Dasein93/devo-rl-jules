@@ -56,11 +56,34 @@ python tools/replay.py --in $LATEST_RUN/traj \
 
 If `manifest.json` is missing, the replay tool will print a warning and fall back to heatmap mode.
 
-**Additional flags:**
+### Replay Customization
+
+You can customize the replay output with several flags. The heatmap mode has been optimized for speed, and you can generate fast previews by adjusting the resolution and frame rate.
+
+**General Flags:**
 - `--fps`: Frames per second for the output video.
-- `--frameskip`: Render every Nth frame to speed up video generation.
-- `--dpi`: Resolution of the video.
-- `--speed`: Adjust the playback speed in the title.
+- `--mode`: `heatmap` or `positions`.
+
+**Performance & Quality Flags (Heatmap Mode):**
+- `--frame_stride N`: Renders only every Nth frame. A value of 2-4 can speed up rendering by 2-4x.
+- `--size WxH`: Sets the output video resolution (e.g., `640x360`). Lower resolutions are faster.
+- `--dpi N`: Sets the dots-per-inch for rendering. Lower values like 80-100 produce smaller, faster renders.
+- `--mb 1|16`: The ffmpeg macro block size. If you see warnings about video dimensions, set this to `1`.
+
+**Fast Preview Example:**
+This command generates a low-quality, fast preview of a heatmap replay. It's useful for quick checks without waiting for a full-quality render.
+```bash
+# find the latest run directory
+LATEST_RUN=$(ls -d artifacts/run_* | tail -n 1)
+
+# render a fast preview
+python tools/replay.py --in $LATEST_RUN/traj \
+  --out artifacts/latest_heatmap_preview.mp4 \
+  --mode heatmap \
+  --frame_stride 4 \
+  --size 480x270 \
+  --dpi 80
+```
 
 ## Artifacts
 Each run directory in `artifacts/` contains:
@@ -77,5 +100,5 @@ Each run directory in `artifacts/` contains:
 ## Testing
 Run the unit tests with:
 ```bash
-pytest -q
+python -m pytest -q
 ```

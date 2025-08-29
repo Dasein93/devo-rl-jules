@@ -23,6 +23,17 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple
 
 
+def parse_size(size_str: str) -> Tuple[int, int]:
+    """Parse a 'WxH' string into a (width, height) tuple."""
+    parts = size_str.lower().split("x")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid size format: '{size_str}'. Expected 'WIDTHxHEIGHT'.")
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid width/height values in '{size_str}'.")
+
+
 def _find_trajectory_files(path: str) -> List[str]:
     """Return a list of .npz files. If `path` is a file, return [path]."""
     if os.path.isfile(path):
@@ -86,49 +97,51 @@ def _render_episode_heatmap(
     obs: np.ndarray,
     writer: imageio.FFMPEGWriter,
     dpi: int = 120,
-    title_prefix: str = ""
+    title_prefix: str = "",
+    frame_stride: int = 1,
+    figsize: Tuple[float, float] = (8, 4.5),
 ) -> None:
     """
     Render one episode as a sequence of heatmaps (agents × features).
+    This function is optimized for speed by avoiding re-creating artists and layouts.
 
     Args:
         obs: (T, A, D)
         writer: open imageio writer
+        dpi: dots per inch for the figure
+        title_prefix: text to prepend to the title
+        frame_stride: render every Nth frame
+        figsize: figure size in inches
     """
     T, A, D = obs.shape
 
-    # Pre-create the figure/axes to avoid slow matplotlib re-creation
-    fig, ax = plt.subplots(figsize=(max(4, D * 0.18), max(2.5, A * 0.45)), dpi=dpi)
-    im = None
+    # Statically configure figure layout. `tight_layout` is slow.
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.15)
 
-    for t in range(T):
+    # Create artists once, update them in the loop.
+    im = ax.imshow(
+        np.zeros((A, D)), aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0
+    )
+    title = ax.set_title("", fontsize=10)
+    ax.set_xlabel("feature")
+    ax.set_ylabel("agent")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("normalized value", rotation=270, labelpad=12)
+
+    for t in range(0, T, frame_stride):
         frame = _normalize_for_visual(obs[t])  # (A, D) in [0,1]
+        im.set_data(frame)
+        title.set_text(f"{title_prefix}t={t}  (A={A}, D={D})")
 
-        ax.clear()
-        ax.set_title(f"{title_prefix}t={t}  (A={A}, D={D})", fontsize=10)
-        im = ax.imshow(frame, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
-        ax.set_xlabel("feature")
-        ax.set_ylabel("agent")
-        # Minimal ticks to keep it readable on many shapes
-        ax.set_xticks([0, D - 1] if D > 1 else [0])
-        ax.set_yticks([0, A - 1] if A > 1 else [0])
-
-        # Draw a small colorbar only on first few frames for speed
-        if t == 0:
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("normalized value", rotation=270, labelpad=12)
-
-        fig.tight_layout()
-
-        # Convert fig to numpy frame for video
+        # Render canvas to numpy array. This is faster than .tostring_rgb().
         fig.canvas.draw()
         rgba_buf = fig.canvas.buffer_rgba()
         w, h = fig.canvas.get_width_height()
         frame_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
-        if w % 16 != 0 or h % 16 != 0:
-             w = (w // 16) * 16
-             h = (h // 16) * 16
-             frame_img = frame_img[:h, :w, :]
         writer.append_data(frame_img)
 
     plt.close(fig)
@@ -141,7 +154,7 @@ def _render_episode_positions(
     episode_idx: int,
     total_episodes: int,
     dpi: int = 120,
-    frameskip: int = 1,
+    frame_stride: int = 1,
     speed: float = 1.0,
 ) -> None:
     """Render one episode as a 2D scatter plot of agent positions."""
@@ -163,7 +176,7 @@ def _render_episode_positions(
     world_bounds = [-1.1, 1.1]
 
     T = actions.shape[0]
-    for t in range(0, T, frameskip):
+    for t in range(0, T, frame_stride):
         # Apply actions and get positions
         env.step({agent: act for agent, act in zip(agent_names, actions[t])})
 
@@ -209,7 +222,10 @@ def make_video(
     mode: str = "heatmap",
     dpi: int = 120,
     speed: float = 1.0,
-    frameskip: int = 1,
+    frame_stride: int = 1,
+    width: int = None,
+    height: int = None,
+    macro_block_size: int = 16,
 ) -> Tuple[int, List[str]]:
     """
     Create an MP4 from a trajectory folder or single .npz.
@@ -233,17 +249,40 @@ def make_video(
             mode = "heatmap"
 
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
-    writer = imageio.get_writer(out_mp4, fps=fps, codec="libx264", bitrate="8000k", quality=8)
+    writer = imageio.get_writer(
+        out_mp4,
+        fps=fps,
+        codec="libx264",
+        bitrate="8000k",
+        quality=8,
+        macro_block_size=macro_block_size,
+    )
     used = []
+
+    # Calculate figsize from width/height if provided
+    figsize = (width / dpi, height / dpi) if width and height else (8, 4.5)
 
     try:
         for idx, f in enumerate(npz_files, start=1):
             title = f"Episode {idx}/{len(npz_files)} — {os.path.basename(f)} "
             if mode == "positions" and manifest:
-                _render_episode_positions(manifest, f, writer, idx, len(npz_files), dpi, frameskip, speed)
+                _render_episode_positions(manifest, f, writer, idx, len(npz_files), dpi, frame_stride, speed)
             else:
-                obs = _load_obs(f)  # (T, A, D)
-                _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title)
+                try:
+                    obs = _load_obs(f)  # (T, A, D)
+                except ValueError as e:
+                    print(f"Error loading observations from {f}: {e}")
+                    # We must exit non-zero.
+                    raise SystemExit(1)
+
+                _render_episode_heatmap(
+                    obs,
+                    writer,
+                    dpi=dpi,
+                    title_prefix=title,
+                    frame_stride=frame_stride,
+                    figsize=figsize,
+                )
             used.append(f)
     finally:
         writer.close()
@@ -252,21 +291,40 @@ def make_video(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Replay recorded trajectories as MP4.")
+    parser = argparse.ArgumentParser(
+        description="Replay recorded trajectories as MP4.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("in", help="Path to trajectory .npz or folder")
     parser.add_argument("--out", type=str, default="replay.mp4", help="Output MP4 file path")
     parser.add_argument("--fps", type=int, default=12, help="Frames per second")
     parser.add_argument("--mode", type=str, choices=["heatmap", "positions"], default="heatmap",
                         help="Replay mode: 'heatmap' for obs, 'positions' for 2D scatter")
-    parser.add_argument("--env_id", type=str, default="mpe.simple_tag_v3",
-                        help="PettingZoo env id for position replay")
-    parser.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames")
-    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
-    parser.add_argument("--frameskip", type=int, default=1, help="Render 1 of N frames")
+
+    # Performance and quality args
+    pgroup = parser.add_argument_group("Performance and Quality")
+    pgroup.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames. Lower is faster.")
+    pgroup.add_argument("--frame_stride", type=int, default=1,
+                        help="Render 1 of N frames to speed up export (e.g., 3 means 3x faster).")
+    pgroup.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (positions mode)")
+    pgroup.add_argument("--size", type=str, default=None, help="Output video size, e.g., '640x360'. Overrides width/height.")
+    pgroup.add_argument("--width", type=int, default=None, help="Output video width in pixels.")
+    pgroup.add_argument("--height", type=int, default=None, help="Output video height in pixels.")
+    pgroup.add_argument("--mb", dest="macro_block_size", type=int, choices=[1, 16], default=16,
+                        help="Macro block size for ffmpeg. If you get warnings about dimensions, set to 1.")
     args = parser.parse_args()
 
     # Rename 'in' to 'trajectory_path' for clarity
     args.trajectory_path = getattr(args, "in")
+
+    # Handle size arguments
+    width, height = args.width, args.height
+    if args.size:
+        try:
+            width, height = parse_size(args.size)
+        except ValueError as e:
+            print(f"Error: {e}")
+            exit(1)
 
     print(f"[replay] input={args.trajectory_path}")
     print(f"[replay] out={args.out} fps={args.fps} mode={args.mode}")
@@ -275,15 +333,21 @@ def main():
         n, used = make_video(
             args.trajectory_path,
             args.out,
-            args.fps,
+            fps=args.fps,
             mode=args.mode,
             dpi=args.dpi,
             speed=args.speed,
-            frameskip=args.frameskip,
+            frame_stride=args.frame_stride,
+            width=width,
+            height=height,
+            macro_block_size=args.macro_block_size,
         )
+    except SystemExit as e:
+        # Error message was already printed by a lower-level function
+        exit(e.code)
     except Exception as e:
-        print(f"[replay] ERROR: {e}")
-        raise
+        print(f"[replay] FATAL: {e}")
+        exit(1)
 
     print(f"[replay] Wrote {args.out} using {n} episode(s).")
     if used:
