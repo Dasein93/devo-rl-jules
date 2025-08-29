@@ -105,13 +105,19 @@ class PPO:
                 self.opt.zero_grad(); loss.backward(); self.opt.step()
 
 class TrajectoryRecorder:
-    def __init__(self, save_dir: str, rec_cfg: Dict = {}):
+    def __init__(self, save_dir: str, env_id: str, env_cfg: dict, global_seed: int, agent_names: list, rec_cfg: Dict = {}):
         self.run_dir = save_dir
         self.sample_rate = int(rec_cfg.get("sample_rate", 1))
         os.makedirs(self.run_dir, exist_ok=True)
         self.step_obs: list = []
         self.step_acts: list = []
         self.buffer: list = []
+
+        self.env_id = env_id
+        self.env_cfg = env_cfg
+        self.global_seed = global_seed
+        self.agent_names = agent_names
+        self.episode_seeds = []
 
     def record_step(self, t, agent_id, obs, act, rew, done, info):
         # For JSONL
@@ -134,8 +140,9 @@ class TrajectoryRecorder:
             padded.append(a)
         return np.stack(padded, axis=0).astype(np.float32)
 
-    def save(self, episode_idx: int):
+    def save(self, episode_idx: int, episode_seed: int):
         if not self.buffer: return
+        self.episode_seeds.append(episode_seed)
 
         path_base = os.path.join(self.run_dir, f"ep_{episode_idx}")
 
@@ -145,13 +152,28 @@ class TrajectoryRecorder:
 
         # NPZ
         obs_mat = self._pad_and_stack(self.step_obs)
-        act_vec = np.array(self.step_acts, dtype=np.int64)
-        np.savez_compressed(f"{path_base}.npz", obs=obs_mat, act=act_vec)
+
+        # Reshape actions to (T, A)
+        n_agents = len(self.agent_names)
+        act_mat = np.array(self.step_acts, dtype=np.int64).reshape(-1, n_agents)
+
+        np.savez_compressed(f"{path_base}.npz", obs=obs_mat, act=act_mat)
 
         # Clear buffers
         self.buffer.clear()
         self.step_obs.clear()
         self.step_acts.clear()
+
+    def save_manifest(self):
+        manifest = {
+            "env_id": self.env_id,
+            "env_cfg": self.env_cfg,
+            "global_seed": self.global_seed,
+            "episode_seeds": self.episode_seeds,
+            "agent_names": self.agent_names,
+        }
+        with open(os.path.join(self.run_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
 
 def flatten_obs(obs_in: Union[Dict[str, np.ndarray], tuple]) -> Tuple[np.ndarray, List[str]]:
     o = obs_in

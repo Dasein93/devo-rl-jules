@@ -42,11 +42,11 @@ def test_recorder_ragged_obs(tmpdir):
     run_dir = os.path.join(save_dir, run_dirs[0])
 
     # Check that a trajectory file was saved
-    replays_dir = os.path.join(run_dir, "replays")
-    assert os.path.exists(replays_dir)
+    traj_dir = os.path.join(run_dir, "traj")
+    assert os.path.exists(traj_dir)
 
     # Check for the last episode's npz file
-    traj_path = os.path.join(replays_dir, "ep_2.npz")
+    traj_path = os.path.join(traj_dir, "ep_2.npz")
     assert os.path.exists(traj_path), f"Expected trajectory file not found at {traj_path}"
 
     # Load the trajectory and check its contents
@@ -58,5 +58,7 @@ def test_recorder_ragged_obs(tmpdir):
     act = data["act"]
 
     assert obs.ndim == 2, f"obs should be 2D, but has shape {obs.shape}"
-    assert act.ndim == 1, f"act should be 1D, but has shape {act.shape}"
-    assert obs.shape[0] == act.shape[0], f"obs and act should have the same length, but have shapes {obs.shape} and {act.shape}"
+    assert act.ndim == 2, f"act should be 2D, but has shape {act.shape}"
+    # obs is (T*A, D), act is (T, A). This is a bit awkward.
+    # The number of agents is obs.shape[0] / act.shape[0]
+    assert obs.shape[0] % act.shape[0] == 0, f"obs length should be a multiple of act length"
