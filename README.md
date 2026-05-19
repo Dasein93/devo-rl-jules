@@ -96,6 +96,10 @@ python tools/genome_trace.py --run artifacts/run_YYYYMMDD_HHMMSS --out genome.pn
 # Phase portrait — (prey, predator) trajectory through 2D space. Closed loops
 # indicate Lotka-Volterra cycling; a point cloud indicates equilibrium.
 python tools/phase_portrait.py --run artifacts/run_YYYYMMDD_HHMMSS --out phase.png
+
+# Auto-generated markdown summary tying together return curves, populations,
+# trait drift, league size, and tournament Elo if present.
+python tools/run_report.py --run artifacts/run_YYYYMMDD_HHMMSS
 ```
 
 ## Tournament
