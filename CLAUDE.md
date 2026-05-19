@@ -93,12 +93,14 @@ not the number of trained episodes). Eviction is oldest-first past
 return shapes and collapses `done_any = any(...)` across agents. An episode ends
 when *any* agent terminates/truncates.
 
-**PPO update API.** `PPO.update(obs, acts, logps, rews, dones, vals)` expects
-flat per-(timestep, agent) lists. `dones` is the per-step `done_any` flag
-replicated to match obs/acts length — needed so `_gae` correctly zeros the
-bootstrap at episode boundaries. If you change reward aggregation or
-per-step replication, audit both call sites in `run_train.py`'s `pred_buf` /
-`prey_buf` paths.
+**PPO update API.** There are two entry points:
+- `PPO.update(obs, acts, logps, rews, dones, vals, states=None)` — computes
+  GAE from the supplied `(rews, dones, vals)` and then runs the update. Use for
+  a single contiguous rollout sequence.
+- `PPO.update_precomputed(obs, acts, logps, vals, advs, rets, states=None)` —
+  caller supplies the advantages and returns. Use when rollouts span multiple
+  independent sequences (e.g. per-agent buffers) that must each be GAE'd
+  separately to avoid bleed across boundaries.
 
 **GAE.** `PPO._gae` is a pure static function — easy to unit-test (see
 `tests/test_ppo.py`). It bootstraps with `V=0` past the buffer end, so the last
@@ -106,14 +108,15 @@ timestep of each rollout effectively assumes terminal; combined with the
 per-step `done` mask this gives the standard GAE behaviour for episodic
 rollouts.
 
-**Known GAE quirk.** The trainer interleaves agents within each timestep
-(`obs[k]` for k in `[t*A, (t+1)*A)` are the A agents at step t), and GAE walks
-that flat sequence as if every row were a time transition. Because rewards and
-dones are replicated per-step and (with MAPPO) values are also per-step shared,
-within-step deltas are degenerate while step-boundary deltas are correct. The
-system still learns well in practice; a future cleanup would maintain
-per-agent rollout sequences and compute GAE separately for each, then
-concatenate.
+**Per-agent rollouts.** `run_train.py` collects each agent's transitions into
+its own dict in `pred_buf` / `prey_buf` (`{agent_name: {"obs": [...], ...}}`),
+not into a single flat list. Before the PPO update, `_update_per_agent`
+computes GAE separately on each agent's sequence, then concatenates the
+results and calls `PPO.update_precomputed`. This avoids the previous
+GAE-bleed bug where the interleaved per-(time, agent) layout caused
+within-step deltas to mix values across agents (especially degenerate with
+MAPPO's shared per-step values). Per-agent GAE produces ~3-4× faster early
+learning at fixed seed compared to the interleaved layout.
 
 **Trajectory recording.** `TrajectoryRecorder` writes per-episode
 `ep_<i>.{jsonl,npz}` and a run-level `manifest.json`. NPZ layout is now

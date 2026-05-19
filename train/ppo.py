@@ -139,20 +139,34 @@ class PPO:
         return adv, rets
 
     def update(self, obs, acts, logps, rews, dones, vals, states=None) -> Dict[str, float]:
+        """Compute GAE from the supplied (rews, dones, vals) and run PPO update.
+        Use `update_precomputed` directly if you want to compute GAE yourself
+        (e.g. per-agent rollouts that must not have GAE bleed across boundaries)."""
         n = len(obs)
         if n == 0:
             return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
         assert len(acts) == n and len(logps) == n and len(vals) == n and len(rews) == n and len(dones) == n, \
             f"Buffer mismatch: {len(obs)=} {len(acts)=} {len(logps)=} {len(rews)=} {len(dones)=} {len(vals)=}"
+        adv_np, rets_np = self._gae(rews, dones, vals, self.cfg.gamma, self.cfg.gae_lambda)
+        return self.update_precomputed(obs, acts, logps, vals, adv_np, rets_np, states=states)
+
+    def update_precomputed(self, obs, acts, logps, vals, advs, rets, states=None) -> Dict[str, float]:
+        """PPO update with caller-supplied advantages and returns. Use this when
+        rollouts span multiple independent sequences (e.g. per-agent buffers)
+        and the caller computed GAE on each sequence separately."""
+        n = len(obs)
+        if n == 0:
+            return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+        assert len(acts) == n and len(logps) == n and len(vals) == n and len(advs) == n and len(rets) == n, \
+            f"Buffer mismatch: {len(obs)=} {len(acts)=} {len(logps)=} {len(vals)=} {len(advs)=} {len(rets)=}"
         cfg = self.cfg
 
-        adv_np, rets_np = self._gae(rews, dones, vals, cfg.gamma, cfg.gae_lambda)
         obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=self.device)
         acts_t = torch.as_tensor(np.asarray(acts), dtype=torch.int64, device=self.device)
         old_logps = torch.as_tensor(np.asarray(logps), dtype=torch.float32, device=self.device)
         old_vals = torch.as_tensor(np.asarray(vals), dtype=torch.float32, device=self.device)
-        adv = torch.as_tensor(adv_np, dtype=torch.float32, device=self.device)
-        rets = torch.as_tensor(rets_np, dtype=torch.float32, device=self.device)
+        adv = torch.as_tensor(np.asarray(advs), dtype=torch.float32, device=self.device)
+        rets_t = torch.as_tensor(np.asarray(rets), dtype=torch.float32, device=self.device)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         if states is None:
@@ -170,7 +184,7 @@ class PPO:
                 b = idx[start:start + cfg.minibatch_size]
                 o, s, a, ol, ad, rt, ov = (
                     obs_t[b], state_t[b], acts_t[b],
-                    old_logps[b], adv[b], rets[b], old_vals[b],
+                    old_logps[b], adv[b], rets_t[b], old_vals[b],
                 )
                 logits = self.ac.actor(o)
                 dist = torch.distributions.Categorical(logits=logits)

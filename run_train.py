@@ -258,8 +258,15 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         train_pred = opp_pred is None
         train_prey = opp_prey is None
 
-        pred_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": [], "states": []}
-        prey_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": [], "states": []}
+        # Per-agent rollout buffers so GAE never bleeds across the
+        # agent boundary inside a timestep. Each agent's transitions form
+        # an independent T-row sequence; we GAE each separately, then
+        # concatenate before the PPO update.
+        def _fresh_buf(agents):
+            return {a: {"obs": [], "acts": [], "logps": [], "vals": [],
+                        "rews": [], "dones": [], "states": []} for a in agents}
+        pred_buf = _fresh_buf(pred_agents)
+        prey_buf = _fresh_buf(prey_agents)
         ep_pred_ret = 0.0
         ep_prey_ret = 0.0
         captures = 0
@@ -299,23 +306,27 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             captures += sum(1 for a in prey_agents if rewards[a] <= -10.0 + 1e-6)
 
             if train_pred:
-                pred_buf["obs"].extend(pred_obs)
-                pred_buf["acts"].extend(pa.tolist())
-                pred_buf["logps"].extend(plogp.tolist())
-                pred_buf["vals"].extend(pv.tolist())
-                pred_buf["rews"].extend([pred_step_rew] * len(pred_agents))
-                pred_buf["dones"].extend([float(done_any)] * len(pred_agents))
-                if centralized:
-                    pred_buf["states"].extend([pred_state] * len(pred_agents))
+                for i, a in enumerate(pred_agents):
+                    seq = pred_buf[a]
+                    seq["obs"].append(pred_obs[i])
+                    seq["acts"].append(int(pa[i]))
+                    seq["logps"].append(float(plogp[i]))
+                    seq["vals"].append(float(pv[i]))
+                    seq["rews"].append(pred_step_rew)
+                    seq["dones"].append(float(done_any))
+                    if centralized:
+                        seq["states"].append(pred_state)
             if train_prey:
-                prey_buf["obs"].extend(prey_obs)
-                prey_buf["acts"].extend(ya.tolist())
-                prey_buf["logps"].extend(ylogp.tolist())
-                prey_buf["vals"].extend(yv.tolist())
-                prey_buf["rews"].extend([prey_step_rew] * len(prey_agents))
-                prey_buf["dones"].extend([float(done_any)] * len(prey_agents))
-                if centralized:
-                    prey_buf["states"].extend([prey_state] * len(prey_agents))
+                for i, a in enumerate(prey_agents):
+                    seq = prey_buf[a]
+                    seq["obs"].append(prey_obs[i])
+                    seq["acts"].append(int(ya[i]))
+                    seq["logps"].append(float(ylogp[i]))
+                    seq["vals"].append(float(yv[i]))
+                    seq["rews"].append(prey_step_rew)
+                    seq["dones"].append(float(done_any))
+                    if centralized:
+                        seq["states"].append(prey_state)
 
             if recorder and t % recorder.sample_rate == 0:
                 recorder.record_step(t, obs, acts, rewards, done_any, infos)
@@ -326,15 +337,32 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         if recorder:
             recorder.save(ep, episode_seed=(seed + ep))
 
-        def _update(ppo_, buf, train_flag):
+        def _update_per_agent(ppo_, per_agent_buf, train_flag):
             if not train_flag:
                 return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
-            kwargs = {k: v for k, v in buf.items() if k != "states"}
-            kwargs["states"] = buf["states"] if centralized and buf["states"] else None
-            return ppo_.update(**kwargs)
+            all_obs, all_acts, all_logps, all_vals = [], [], [], []
+            all_advs, all_rets, all_states = [], [], []
+            cfg_g = ppo_.cfg
+            for _agent, seq in per_agent_buf.items():
+                if not seq["obs"]:
+                    continue
+                adv, rets = PPO._gae(seq["rews"], seq["dones"], seq["vals"],
+                                     cfg_g.gamma, cfg_g.gae_lambda)
+                all_obs.extend(seq["obs"])
+                all_acts.extend(seq["acts"])
+                all_logps.extend(seq["logps"])
+                all_vals.extend(seq["vals"])
+                all_advs.extend(adv.tolist())
+                all_rets.extend(rets.tolist())
+                if seq["states"]:
+                    all_states.extend(seq["states"])
+            return ppo_.update_precomputed(
+                all_obs, all_acts, all_logps, all_vals, all_advs, all_rets,
+                states=all_states if all_states else None,
+            )
 
-        pred_stats = _update(ppo_pred, pred_buf, train_pred)
-        prey_stats = _update(ppo_prey, prey_buf, train_prey)
+        pred_stats = _update_per_agent(ppo_pred, pred_buf, train_pred)
+        prey_stats = _update_per_agent(ppo_prey, prey_buf, train_prey)
 
         pred_returns.append(ep_pred_ret / max(1, len(pred_agents)))
         prey_returns.append(ep_prey_ret / max(1, len(prey_agents)))
