@@ -11,8 +11,10 @@ Predator–prey digital evolution + RL sandbox on PettingZoo MPE `simple_tag_v3`
 - **GAE, value-loss clipping, gradient clipping** in PPO.
 - **Trajectory recording** with per-step positions for offline replay.
 - **Two envs**: PettingZoo `simple_tag_v3` (fixed roster, no death) and a custom
-  `ecosystem` env (per-agent HP / energy, mortality, reproduction, food field).
-  Switch via `env.id` in the config — `configs/base.yaml` vs `configs/ecosystem.yaml`.
+  `ecosystem` env (per-agent HP / energy, mortality, reproduction, food field,
+  heritable genome of speed / HP / sense radius mutated on reproduction).
+  Switch via `env.id` in the config — `configs/base.yaml`, `configs/ecosystem.yaml`,
+  or `configs/ecosystem_lv.yaml` (Lotka-Volterra tuned).
 
 ## Quickstart
 
@@ -84,6 +86,17 @@ python tools/compare_runs.py \
 
 `--metric` is any column from `metrics.csv` (`pred_return`, `prey_return`,
 `captures`, `ep_steps`, `pred_v_loss`, ...).
+
+## Diagnostics (ecosystem env)
+
+```bash
+# Per-team trait drift over training — predator/prey speed, HP, sense radius.
+python tools/genome_trace.py --run artifacts/run_YYYYMMDD_HHMMSS --out genome.png
+
+# Phase portrait — (prey, predator) trajectory through 2D space. Closed loops
+# indicate Lotka-Volterra cycling; a point cloud indicates equilibrium.
+python tools/phase_portrait.py --run artifacts/run_YYYYMMDD_HHMMSS --out phase.png
+```
 
 ## Tournament
 

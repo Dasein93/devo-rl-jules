@@ -43,6 +43,10 @@ python tools/tournament.py --run artifacts/run_YYYYMMDD_HHMMSS --episodes 3
 python tools/compare_runs.py --runs artifacts/run_A artifacts/run_B \
   --labels A B --metric pred_return --out compare.png
 
+# Ecosystem-specific diagnostics (need genome columns / pop columns in metrics.csv).
+python tools/genome_trace.py --run artifacts/run_YYYYMMDD_HHMMSS --out genome.png
+python tools/phase_portrait.py --run artifacts/run_YYYYMMDD_HHMMSS --out phase.png
+
 # Tests — use `python -m pytest`, not `pytest`, because the system-wide `pytest`
 # is a separate uv-managed install that does not see the project requirements.
 python -m pytest -q
