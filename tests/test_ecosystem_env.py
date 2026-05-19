@@ -24,8 +24,8 @@ def test_obs_dim_consistent_across_agents():
     obs, _ = env.reset(seed=0)
     dims = {v.shape[0] for v in obs.values()}
     assert len(dims) == 1
-    # 6 own + 6*K neighbours + 1 own-cell food
-    assert next(iter(dims)) == 6 + 6 * 4 + 1
+    # 6 own + 6*K neighbours + 1 own-cell food + 3 own-genome
+    assert next(iter(dims)) == 6 + 6 * 4 + 1 + 3
 
 
 def test_action_and_observation_space_shapes():

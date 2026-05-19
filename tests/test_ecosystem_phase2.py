@@ -79,6 +79,7 @@ def test_child_starts_at_partial_energy_and_full_hp():
         repro_child_hp_frac=1.0, repro_child_energy_frac=0.5,
         pred_max_hp=100.0, pred_max_energy=100.0,
         pred_energy_cost=0.0, attack_range=0.0,
+        genome_enabled=False,            # pin genome to 1.0 for this test
     )
     env.reset(seed=0)
     env._energy[0] = 100.0

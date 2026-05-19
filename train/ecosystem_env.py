@@ -1,5 +1,5 @@
 """Custom predator/prey ecosystem env with per-agent HP, energy, mortality,
-reproduction, and a food field for prey.
+reproduction, foraging, and heritable genomes.
 
 PettingZoo parallel-API compatible. Agent names follow the simple_tag convention
 ("adversary_*" for predators, "agent_*" for prey) so `split_teams` and the
@@ -7,8 +7,9 @@ league / replay tooling work unchanged.
 
 Phases:
 - Phase 1 (mortality only): no reproduction, no food. Population only shrinks.
-- Phase 2 (this file): reproduction in free slots, food field for prey.
-- Phase 3 (TODO): heritable genome mutated on reproduction.
+- Phase 2: reproduction in free slots, food field for prey.
+- Phase 3 (this file): heritable genome (speed, HP, sense radius). Children
+  inherit the parent's genome with Gaussian mutation.
 """
 from __future__ import annotations
 import math
@@ -75,6 +76,15 @@ class EcosystemConfig:
     # Boundary (soft penalty when outside [-0.9, 0.9])
     boundary_threshold: float = 0.9
     boundary_penalty: float = 5.0     # multiplied by overshoot^2
+
+    # Genome (Phase 3). Per-agent multipliers on (speed, hp_cap, sense_radius).
+    # Children inherit parent's genome plus Gaussian noise (mutation_sigma).
+    # All genes are clamped to [genome_min, genome_max].
+    genome_enabled: bool = True
+    genome_init_sigma: float = 0.08   # std-dev of initial uniform genome variation
+    mutation_sigma: float = 0.05
+    genome_min: float = 0.5
+    genome_max: float = 2.0
 
     seed: int = 42
 
@@ -145,6 +155,10 @@ class EcosystemEnv:
         self._alive = np.zeros(N, dtype=bool)
         self._is_pred = np.zeros(N, dtype=bool)
         self._is_pred[: self._max_pred] = True
+        # Genome: 3 traits per agent — speed_g, hp_g, sense_g — each a multiplier
+        # on the team's base stat. Initialised to ~1 with small noise, mutated on
+        # reproduction, clamped to [genome_min, genome_max].
+        self._genome = np.ones((N, 3), dtype=np.float32)
         self._t = 0
         self._rng = np.random.default_rng(self.cfg.seed)
 
@@ -152,8 +166,9 @@ class EcosystemEnv:
         G = self.cfg.food_grid_size
         self._food = np.full((G, G), self.cfg.food_cell_max, dtype=np.float32)
 
-        # Obs: own (6) + K nearest neighbours (6 each) + own-cell food (1).
-        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs + 1
+        # Obs: own (6) + K nearest neighbours (6 each) + own-cell food (1)
+        # + own genome (3).
+        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs + 1 + 3
         self._obs_space = _Box(-np.inf, np.inf, (self._obs_dim,), np.float32)
         self._act_space = _Discrete(5)
 
@@ -187,6 +202,15 @@ class EcosystemEnv:
         self._cooldown[:] = 0
         self._alive[:] = False
 
+        # Initial genome: uniform random in [1 - σ, 1 + σ] per trait, clamped.
+        if self.cfg.genome_enabled:
+            self._genome[:] = np.clip(
+                1.0 + self._rng.normal(0.0, self.cfg.genome_init_sigma, size=(self._N, 3)),
+                self.cfg.genome_min, self.cfg.genome_max,
+            ).astype(np.float32)
+        else:
+            self._genome[:] = 1.0
+
         # Spawn the starting roster: first n_start_pred predator slots, first n_start_prey prey slots.
         pred_start_idx = np.arange(self._n_start_pred)
         prey_start_idx = np.arange(self._n_start_prey) + self._max_pred
@@ -195,7 +219,9 @@ class EcosystemEnv:
             self._pos[idx_arr] = self._rng.uniform(
                 -half * 0.8, half * 0.8, size=(len(idx_arr), 2)
             ).astype(np.float32)
-            self._hp[idx_arr] = self.cfg.pred_max_hp if is_pred else self.cfg.prey_max_hp
+            # HP cap scales with hp_g (trait[1]) so genome immediately matters.
+            base_hp = self.cfg.pred_max_hp if is_pred else self.cfg.prey_max_hp
+            self._hp[idx_arr] = base_hp * self._genome[idx_arr, 1]
             self._energy[idx_arr] = self.cfg.pred_max_energy if is_pred else self.cfg.prey_max_energy
 
         # Refill food grid.
@@ -209,12 +235,14 @@ class EcosystemEnv:
         cfg = self.cfg
         half = cfg.world_size / 2.0
 
-        # 1. Apply movement for alive agents only. Velocity = action_dir * speed.
+        # 1. Apply movement for alive agents only. Velocity = action_dir * effective speed,
+        # where effective speed = base_speed * genome[i, 0] (speed gene).
         for name, action in actions.items():
             i = self._index(name)
             if not self._alive[i]:
                 continue
-            speed = cfg.pred_speed if self._is_pred[i] else cfg.prey_speed
+            base_speed = cfg.pred_speed if self._is_pred[i] else cfg.prey_speed
+            speed = base_speed * float(self._genome[i, 0])
             self._vel[i] = _ACTION_VEC[int(action) % 5] * speed
             self._pos[i] += self._vel[i]
             self._pos[i] = np.clip(self._pos[i], -half, half)
@@ -332,7 +360,12 @@ class EcosystemEnv:
         return self.cfg.pred_max_energy if self._is_pred[i] else self.cfg.prey_max_energy
 
     def _hp_cap(self, i: int) -> float:
-        return self.cfg.pred_max_hp if self._is_pred[i] else self.cfg.prey_max_hp
+        base = self.cfg.pred_max_hp if self._is_pred[i] else self.cfg.prey_max_hp
+        return base * float(self._genome[i, 1])
+
+    def _sense_radius(self, i: int) -> float:
+        base = self.cfg.pred_sense_radius if self._is_pred[i] else self.cfg.prey_sense_radius
+        return base * float(self._genome[i, 2])
 
     def _world_to_grid(self, pos: np.ndarray) -> Tuple[int, int]:
         """Map a 2D world coordinate to (row, col) in the food grid."""
@@ -385,7 +418,16 @@ class EcosystemEnv:
             self._energy[i] *= cfg.repro_parent_energy_keep
             self._cooldown[i] = cfg.repro_cooldown
 
-            # Spawn child near the parent, full HP, partial energy.
+            # Inherit parent's genome with Gaussian mutation, clamped.
+            if cfg.genome_enabled:
+                mutation = self._rng.normal(0.0, cfg.mutation_sigma, size=3).astype(np.float32)
+                self._genome[child_slot] = np.clip(
+                    self._genome[i] + mutation, cfg.genome_min, cfg.genome_max,
+                )
+            else:
+                self._genome[child_slot] = 1.0
+
+            # Spawn child near the parent, full HP (per its own genome), partial energy.
             offset = self._rng.uniform(-0.05, 0.05, size=2).astype(np.float32)
             self._pos[child_slot] = np.clip(self._pos[i] + offset, -half, half)
             self._vel[child_slot] = 0.0
@@ -401,6 +443,20 @@ class EcosystemEnv:
 
         return births
 
+    def mean_genome(self, team: str) -> np.ndarray:
+        """Return mean (speed_g, hp_g, sense_g) over currently-alive agents of `team`.
+        Returns NaN array if no agents alive."""
+        if team == "predator":
+            idx = np.arange(self._max_pred)
+        elif team == "prey":
+            idx = np.arange(self._max_pred, self._N)
+        else:
+            raise ValueError(team)
+        mask = self._alive[idx]
+        if not mask.any():
+            return np.full(3, np.nan, dtype=np.float32)
+        return self._genome[idx][mask].mean(axis=0)
+
     def _build_obs_dict(self) -> Dict[str, np.ndarray]:
         cfg = self.cfg
         out: Dict[str, np.ndarray] = {}
@@ -410,7 +466,7 @@ class EcosystemEnv:
             is_pred = bool(self._is_pred[i])
             max_hp = cfg.pred_max_hp if is_pred else cfg.prey_max_hp
             max_energy = cfg.pred_max_energy if is_pred else cfg.prey_max_energy
-            sense_r = cfg.pred_sense_radius if is_pred else cfg.prey_sense_radius
+            sense_r = self._sense_radius(i)
 
             # Own state.
             obs[0:2] = self._pos[i]
@@ -434,10 +490,10 @@ class EcosystemEnv:
                     obs[off + 4] = 1.0 if self._is_pred[j] else 0.0
                     obs[off + 5] = 0.0 if self._is_pred[j] else 1.0
 
-            # Own-cell food scalar (last dim). Predators see it but it conveys
-            # nothing useful for them; cheap to include uniformly.
+            # Own-cell food scalar + own genome (last 1+3 dims).
             gx, gy = self._world_to_grid(self._pos[i])
-            obs[-1] = float(self._food[gx, gy]) / max(1e-6, cfg.food_cell_max)
+            obs[-4] = float(self._food[gx, gy]) / max(1e-6, cfg.food_cell_max)
+            obs[-3:] = self._genome[i]
 
             out[self._all_names[i]] = obs
         return out

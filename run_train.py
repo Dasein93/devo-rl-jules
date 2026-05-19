@@ -281,6 +281,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             csv.writer(f).writerow([
                 "episode", "pred_return", "prey_return", "captures", "ep_steps",
                 "pred_pop_end", "prey_pop_end", "pred_pop_mean", "prey_pop_mean",
+                "pred_speed_g", "pred_hp_g", "pred_sense_g",
+                "prey_speed_g", "prey_hp_g", "prey_sense_g",
                 "pred_pg_loss", "pred_v_loss", "pred_entropy",
                 "prey_pg_loss", "prey_v_loss", "prey_entropy",
                 "pred_league", "prey_league",
@@ -440,11 +442,23 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         pred_pop_mean = float(np.mean(pop_pred_series)) if pop_pred_series else float(len(pred_agents))
         prey_pop_mean = float(np.mean(pop_prey_series)) if pop_prey_series else float(len(prey_agents))
 
+        # Genome means at end-of-episode (NaN if env doesn't expose mean_genome,
+        # e.g. simple_tag — write 0 so the CSV columns stay numeric).
+        def _team_mean_genome(team: str):
+            if hasattr(env, "mean_genome"):
+                g = env.mean_genome(team)
+                return [0.0 if np.isnan(v) else float(v) for v in g]
+            return [0.0, 0.0, 0.0]
+        pred_g = _team_mean_genome("predator")
+        prey_g = _team_mean_genome("prey")
+
         with open(metrics_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 ep,
                 f"{pred_returns[-1]:.6f}", f"{prey_returns[-1]:.6f}", captures, t,
                 pred_pop_end, prey_pop_end, f"{pred_pop_mean:.3f}", f"{prey_pop_mean:.3f}",
+                f"{pred_g[0]:.4f}", f"{pred_g[1]:.4f}", f"{pred_g[2]:.4f}",
+                f"{prey_g[0]:.4f}", f"{prey_g[1]:.4f}", f"{prey_g[2]:.4f}",
                 f"{pred_stats['pg_loss']:.6f}", f"{pred_stats['v_loss']:.6f}", f"{pred_stats['entropy']:.6f}",
                 f"{prey_stats['pg_loss']:.6f}", f"{prey_stats['v_loss']:.6f}", f"{prey_stats['entropy']:.6f}",
                 len(league_pred), len(league_prey),
