@@ -17,9 +17,20 @@ import torch
 
 from train.ppo import PPO, PPOConfig, ActorCritic, TrajectoryRecorder, flatten_obs, set_seed, split_teams
 from train.league import League
+from train.ecosystem_env import make_ecosystem_env
 
 
-def make_env(n_predators=2, n_prey=2, max_cycles=200, seed=42):
+def make_env(env_id: str = "mpe.simple_tag_v3", n_predators: int = 2, n_prey: int = 2,
+             max_cycles: int = 200, seed: int = 42, ecosystem_overrides: Optional[dict] = None):
+    """Factory dispatching on env.id. Returns a PettingZoo-parallel-API compatible env."""
+    if env_id == "ecosystem":
+        overrides = dict(ecosystem_overrides or {})
+        overrides.setdefault("n_predators_start", n_predators)
+        overrides.setdefault("n_prey_start", n_prey)
+        overrides.setdefault("max_steps", max_cycles)
+        env = make_ecosystem_env(seed=seed, **overrides)
+        env.reset(seed=seed)
+        return env
     from pettingzoo.mpe import simple_tag_v3
     env = simple_tag_v3.parallel_env(
         num_adversaries=n_predators,
@@ -43,10 +54,18 @@ def _reset(env, seed=None):
 
 
 def _step(env, actions):
+    """Step the env and return (next_obs, rewards, done_any, infos).
+
+    `done_any` signals the *episode* is over (not just one agent). We use
+    `truncations` for this rather than `terminations`: a per-agent termination
+    means that one agent died, not that the episode is over — the ecosystem env
+    relies on this distinction. simple_tag only ever truncates (no per-agent
+    termination), so the rule works for both envs.
+    """
     out = env.step(actions)
     if isinstance(out, tuple) and len(out) == 5:
         next_obs, rewards, terminations, truncations, infos = out
-        done_any = bool(any(terminations.values()) or any(truncations.values()))
+        done_any = bool(any(truncations.values())) or len(next_obs) == 0
         return next_obs, rewards, done_any, infos
     if isinstance(out, tuple) and len(out) == 4:
         next_obs, rewards, dones, infos = out
@@ -165,12 +184,19 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
     ckpt_dir = os.path.join(out_dir, "checkpoints"); ensure_dir(ckpt_dir)
     league_dir = os.path.join(out_dir, "league"); ensure_dir(league_dir)
 
-    env = make_env(n_predators=n_pred, n_prey=n_prey, max_cycles=max_steps, seed=seed)
+    env_id = env_cfg.get("id", "mpe.simple_tag_v3")
+    ecosystem_overrides = dict(env_cfg.get("ecosystem", {}) or {})
+    env = make_env(env_id=env_id, n_predators=n_pred, n_prey=n_prey,
+                   max_cycles=max_steps, seed=seed,
+                   ecosystem_overrides=ecosystem_overrides)
     obs0 = _reset(env, seed=seed)
     agents = sorted(obs0.keys())
     pred_agents, prey_agents = split_teams(agents)
     if not pred_agents or not prey_agents:
         raise RuntimeError(f"Need at least one predator and one prey; got pred={pred_agents}, prey={prey_agents}")
+    # `pred_agents` / `prey_agents` is the initial roster of names. In the
+    # ecosystem env, the set of alive agents only shrinks during an episode
+    # (Phase 1: no births). We filter to currently-alive each step.
 
     pred_obs_dim = _team_obs_dim(pred_agents, obs0)
     prey_obs_dim = _team_obs_dim(prey_agents, obs0)
@@ -243,6 +269,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         with open(metrics_path, "w", newline="") as f:
             csv.writer(f).writerow([
                 "episode", "pred_return", "prey_return", "captures", "ep_steps",
+                "pred_pop_end", "prey_pop_end", "pred_pop_mean", "prey_pop_mean",
                 "pred_pg_loss", "pred_v_loss", "pred_entropy",
                 "prey_pg_loss", "prey_v_loss", "prey_entropy",
                 "pred_league", "prey_league",
@@ -273,42 +300,63 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         done_any = False
         t = 0
 
+        # Track populations across the episode (ecosystem env only writes
+        # meaningful values; simple_tag always has full roster alive).
+        pop_pred_series: List[int] = []
+        pop_prey_series: List[int] = []
+
         while not done_any:
-            pred_obs = _stack_team(pred_agents, obs, pred_obs_dim)
-            prey_obs = _stack_team(prey_agents, obs, prey_obs_dim)
-            pred_state = _team_state(pred_obs) if centralized else None
-            prey_state = _team_state(prey_obs) if centralized else None
+            # Filter the initial roster down to whoever is still in the obs dict.
+            # In simple_tag this equals the full roster every step; in ecosystem
+            # it shrinks as agents die.
+            pred_alive = [a for a in pred_agents if a in obs]
+            prey_alive = [a for a in prey_agents if a in obs]
+            pop_pred_series.append(len(pred_alive))
+            pop_prey_series.append(len(prey_alive))
+            if not pred_alive or not prey_alive:
+                # One side wiped out — env will truncate next step, but bail now
+                # so we don't try to act on an empty team.
+                done_any = True
+                break
+
+            pred_obs_stack = _stack_team(pred_alive, obs, pred_obs_dim)
+            prey_obs_stack = _stack_team(prey_alive, obs, prey_obs_dim)
+            pred_state = _team_state(pred_obs_stack) if centralized else None
+            prey_state = _team_state(prey_obs_stack) if centralized else None
 
             # Trained team: full step (actor + critic). Opponent (league snapshot):
             # actor only, since its critic shape may not match our centralised state.
             if train_pred:
-                pa, plogp, pv = _act_team(pred_actor, pred_obs, device, state=pred_state)
+                pa, plogp, pv = _act_team(pred_actor, pred_obs_stack, device, state=pred_state)
             else:
-                pa, plogp = _act_team_actor_only(pred_actor, pred_obs, device)
-                pv = np.zeros(len(pred_agents), dtype=np.float32)
+                pa, plogp = _act_team_actor_only(pred_actor, pred_obs_stack, device)
+                pv = np.zeros(len(pred_alive), dtype=np.float32)
             if train_prey:
-                ya, ylogp, yv = _act_team(prey_actor, prey_obs, device, state=prey_state)
+                ya, ylogp, yv = _act_team(prey_actor, prey_obs_stack, device, state=prey_state)
             else:
-                ya, ylogp = _act_team_actor_only(prey_actor, prey_obs, device)
-                yv = np.zeros(len(prey_agents), dtype=np.float32)
+                ya, ylogp = _act_team_actor_only(prey_actor, prey_obs_stack, device)
+                yv = np.zeros(len(prey_alive), dtype=np.float32)
 
             acts = {}
-            for i, a in enumerate(pred_agents): acts[a] = int(pa[i])
-            for i, a in enumerate(prey_agents): acts[a] = int(ya[i])
+            for i, a in enumerate(pred_alive): acts[a] = int(pa[i])
+            for i, a in enumerate(prey_alive): acts[a] = int(ya[i])
 
             next_obs, rewards, done_any, infos = _step(env, acts)
 
-            pred_step_rew = float(np.mean([rewards[a] for a in pred_agents]))
-            prey_step_rew = float(np.mean([rewards[a] for a in prey_agents]))
-            ep_pred_ret += sum(rewards[a] for a in pred_agents)
-            ep_prey_ret += sum(rewards[a] for a in prey_agents)
-            # simple_tag awards prey -10 / predator +10 per collision; count any prey hit at this step.
-            captures += sum(1 for a in prey_agents if rewards[a] <= -10.0 + 1e-6)
+            pred_step_rew = float(np.mean([rewards.get(a, 0.0) for a in pred_alive])) if pred_alive else 0.0
+            prey_step_rew = float(np.mean([rewards.get(a, 0.0) for a in prey_alive])) if prey_alive else 0.0
+            ep_pred_ret += sum(rewards.get(a, 0.0) for a in pred_alive)
+            ep_prey_ret += sum(rewards.get(a, 0.0) for a in prey_alive)
+            # Capture detection: prey reward <= -reward_per_hit means it took a hit this step.
+            # For simple_tag this is -10; for ecosystem it's also -10 by default config.
+            captures += sum(1 for a in prey_alive if rewards.get(a, 0.0) <= -10.0 + 1e-6)
 
             if train_pred:
-                for i, a in enumerate(pred_agents):
+                for i, a in enumerate(pred_alive):
                     seq = pred_buf[a]
-                    seq["obs"].append(pred_obs[i])
+                    # An agent that just died this step has a is its last action; we'll
+                    # mark its sequence's final done=1 post-loop. For now just append.
+                    seq["obs"].append(pred_obs_stack[i])
                     seq["acts"].append(int(pa[i]))
                     seq["logps"].append(float(plogp[i]))
                     seq["vals"].append(float(pv[i]))
@@ -317,9 +365,9 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                     if centralized:
                         seq["states"].append(pred_state)
             if train_prey:
-                for i, a in enumerate(prey_agents):
+                for i, a in enumerate(prey_alive):
                     seq = prey_buf[a]
-                    seq["obs"].append(prey_obs[i])
+                    seq["obs"].append(prey_obs_stack[i])
                     seq["acts"].append(int(ya[i]))
                     seq["logps"].append(float(ylogp[i]))
                     seq["vals"].append(float(yv[i]))
@@ -329,10 +377,19 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                         seq["states"].append(prey_state)
 
             if recorder and t % recorder.sample_rate == 0:
+                # Pass the per-step alive set so the recorder can populate
+                # the alive mask for the ecosystem replay.
                 recorder.record_step(t, obs, acts, rewards, done_any, infos)
 
             obs = next_obs
             t += 1
+
+        # Finalize each per-agent sequence: ensure last `done` is 1.0 so per-agent
+        # GAE bootstraps with V=0 at the agent's death (or episode end).
+        for buf in (pred_buf, prey_buf):
+            for seq in buf.values():
+                if seq["dones"]:
+                    seq["dones"][-1] = 1.0
 
         if recorder:
             recorder.save(ep, episode_seed=(seed + ep))
@@ -367,10 +424,16 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         pred_returns.append(ep_pred_ret / max(1, len(pred_agents)))
         prey_returns.append(ep_prey_ret / max(1, len(prey_agents)))
 
+        pred_pop_end = pop_pred_series[-1] if pop_pred_series else len(pred_agents)
+        prey_pop_end = pop_prey_series[-1] if pop_prey_series else len(prey_agents)
+        pred_pop_mean = float(np.mean(pop_pred_series)) if pop_pred_series else float(len(pred_agents))
+        prey_pop_mean = float(np.mean(pop_prey_series)) if pop_prey_series else float(len(prey_agents))
+
         with open(metrics_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 ep,
                 f"{pred_returns[-1]:.6f}", f"{prey_returns[-1]:.6f}", captures, t,
+                pred_pop_end, prey_pop_end, f"{pred_pop_mean:.3f}", f"{prey_pop_mean:.3f}",
                 f"{pred_stats['pg_loss']:.6f}", f"{pred_stats['v_loss']:.6f}", f"{pred_stats['entropy']:.6f}",
                 f"{prey_stats['pg_loss']:.6f}", f"{prey_stats['v_loss']:.6f}", f"{prey_stats['entropy']:.6f}",
                 len(league_pred), len(league_prey),

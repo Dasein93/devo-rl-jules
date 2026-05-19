@@ -232,6 +232,7 @@ class TrajectoryRecorder:
         self.step_obs: list = []   # list of per-step (A, D_pad) arrays
         self.step_acts: list = []  # list of per-step (A,) arrays
         self.step_pos: list = []   # list of per-step (A, 2) arrays
+        self.step_alive: list = []  # list of per-step (A,) bool arrays — True when agent was alive
         self.buffer: list = []     # JSONL records
 
         self.env_id = env_id
@@ -249,26 +250,46 @@ class TrajectoryRecorder:
         return v
 
     def record_step(self, t, obs_dict, acts_dict, rewards_dict, done_any, infos):
+        # Per-agent JSONL records — only for currently-alive agents (those in obs_dict).
         for agent_id in self.agent_names:
+            if agent_id not in obs_dict:
+                continue
             self.buffer.append({
                 "t": t, "agent_id": agent_id,
                 "obs": np.asarray(obs_dict[agent_id]).tolist(),
-                "act": int(acts_dict[agent_id]),
-                "rew": float(rewards_dict[agent_id]),
+                "act": int(acts_dict.get(agent_id, -1)),
+                "rew": float(rewards_dict.get(agent_id, 0.0)),
                 "done": bool(done_any),
                 "info": infos.get(agent_id, {}),
             })
 
-        max_d = max(int(np.size(obs_dict[a])) for a in self.agent_names)
-        row_obs = np.stack([self._pad_row(obs_dict[a], max_d) for a in self.agent_names], axis=0)
-        row_acts = np.array([int(acts_dict[a]) for a in self.agent_names], dtype=np.int64)
+        # Per-step (A, D) arrays — fixed-roster, padded for dead agents.
+        present = [a for a in self.agent_names if a in obs_dict]
+        if present:
+            max_d = max(int(np.size(obs_dict[a])) for a in present)
+        else:
+            max_d = 1
+        row_obs = np.zeros((len(self.agent_names), max_d), dtype=np.float32)
+        row_acts = np.full(len(self.agent_names), -1, dtype=np.int64)
+        row_alive = np.zeros(len(self.agent_names), dtype=bool)
+        for k, a in enumerate(self.agent_names):
+            if a in obs_dict:
+                row_obs[k] = self._pad_row(obs_dict[a], max_d)
+                row_acts[k] = int(acts_dict.get(a, -1))
+                row_alive[k] = True
         self.step_obs.append(row_obs)
         self.step_acts.append(row_acts)
+        self.step_alive.append(row_alive)
 
-        if "simple_tag" in self.env_id:
-            row_pos = np.stack(
-                [np.asarray(obs_dict[a], dtype=np.float32)[2:4] for a in self.agent_names], axis=0
-            )
+        # Position extraction. Two cases:
+        # (a) simple_tag: obs[2:4] is (x, y). Apply to alive agents; dead → NaN.
+        # (b) ecosystem: obs[0:2] is (x, y).
+        if "simple_tag" in self.env_id or self.env_id == "ecosystem":
+            pos_offset = 0 if self.env_id == "ecosystem" else 2
+            row_pos = np.full((len(self.agent_names), 2), np.nan, dtype=np.float32)
+            for k, a in enumerate(self.agent_names):
+                if a in obs_dict:
+                    row_pos[k] = np.asarray(obs_dict[a], dtype=np.float32)[pos_offset:pos_offset + 2]
             self.step_pos.append(row_pos)
 
     def save(self, episode_idx: int, episode_seed: int):
@@ -290,6 +311,8 @@ class TrajectoryRecorder:
             "act": act_mat,
             "agent_names": np.asarray(self.agent_names),
         }
+        if self.step_alive:
+            payload["alive"] = np.stack(self.step_alive, axis=0)   # (T, A) bool
         if self.step_pos:
             payload["pos"] = np.stack(self.step_pos, axis=0).astype(np.float32)  # (T, A, 2)
 
@@ -299,6 +322,7 @@ class TrajectoryRecorder:
         self.step_obs.clear()
         self.step_acts.clear()
         self.step_pos.clear()
+        self.step_alive.clear()
 
     def save_manifest(self):
         agent_roles = ["predator" if "adversary" in name else "prey" for name in self.agent_names]
