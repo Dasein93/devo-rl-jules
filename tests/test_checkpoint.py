@@ -50,6 +50,11 @@ def test_checkpoint_resume(tmpdir):
     metrics_path = os.path.join(run_dir, "metrics.csv")
     with open(metrics_path) as f:
         rows = list(csv.reader(f))
-    assert rows[0][0] == "episode"
+    header = rows[0]
+    assert header[0] == "episode"
+    assert "captures" in header and "ep_steps" in header
     assert rows[-1][0] == "10"
     assert len(rows) == 11  # header + 10 episodes
+    # captures should be a non-negative integer-like value
+    cap_col = header.index("captures")
+    assert int(rows[-1][cap_col]) >= 0

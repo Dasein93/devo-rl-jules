@@ -211,7 +211,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
     if start_ep == 1:
         with open(metrics_path, "w", newline="") as f:
             csv.writer(f).writerow([
-                "episode", "pred_return", "prey_return",
+                "episode", "pred_return", "prey_return", "captures", "ep_steps",
                 "pred_pg_loss", "pred_v_loss", "pred_entropy",
                 "prey_pg_loss", "prey_v_loss", "prey_entropy",
                 "pred_league", "prey_league",
@@ -231,6 +231,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         prey_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": []}
         ep_pred_ret = 0.0
         ep_prey_ret = 0.0
+        captures = 0
         done_any = False
         t = 0
 
@@ -251,6 +252,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
             prey_step_rew = float(np.mean([rewards[a] for a in prey_agents]))
             ep_pred_ret += sum(rewards[a] for a in pred_agents)
             ep_prey_ret += sum(rewards[a] for a in prey_agents)
+            # simple_tag awards prey -10 / predator +10 per collision; count any prey hit at this step.
+            captures += sum(1 for a in prey_agents if rewards[a] <= -10.0 + 1e-6)
 
             if train_pred:
                 pred_buf["obs"].extend(pred_obs)
@@ -286,7 +289,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         with open(metrics_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 ep,
-                f"{pred_returns[-1]:.6f}", f"{prey_returns[-1]:.6f}",
+                f"{pred_returns[-1]:.6f}", f"{prey_returns[-1]:.6f}", captures, t,
                 f"{pred_stats['pg_loss']:.6f}", f"{pred_stats['v_loss']:.6f}", f"{pred_stats['entropy']:.6f}",
                 f"{prey_stats['pg_loss']:.6f}", f"{prey_stats['v_loss']:.6f}", f"{prey_stats['entropy']:.6f}",
                 len(league_pred), len(league_prey),

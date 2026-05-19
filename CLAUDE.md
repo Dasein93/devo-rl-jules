@@ -32,14 +32,18 @@ python tools/eval.py \
   --episodes 20
 # Either side can be omitted to use a random-init baseline.
 
+# Tournament: round-robin between all league snapshots → captures heatmap + Elo.
+python tools/tournament.py --run artifacts/run_YYYYMMDD_HHMMSS --episodes 3
+
 # Tests — use `python -m pytest`, not `pytest`, because the system-wide `pytest`
 # is a separate uv-managed install that does not see the project requirements.
 python -m pytest -q
 python -m pytest tests/test_ppo.py::test_gae_terminal_zeros_bootstrap -v
 
 # Replay. `in` is a POSITIONAL argument; do NOT pass it as --in.
+# Multi-episode directories are sorted by integer ep index, not alphabetically.
 python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode heatmap
-python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode positions --frameskip 2
+python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode positions --frameskip 2 --trail 20
 ```
 
 `tests/test_replay_positions.py` invokes `run_train.py` and `tools/replay.py` via
@@ -106,8 +110,26 @@ artifacts/run_<UTC timestamp>/
 ├── league/{predator,prey}/snap_*.pt    # frozen snapshots
 ├── plots/return.png                    # per-team return curves
 ├── traj/ep_*.{npz,jsonl} + manifest.json
-└── metrics.csv                         # ep, per-team returns/losses, league sizes
+├── metrics.csv                         # ep, returns, captures, ep_steps, losses, league sizes
+└── tournament/                         # written by tools/tournament.py
+    ├── scores.csv                      # pair-wise captures, episode length, returns
+    ├── ratings.csv                     # Elo per snapshot per team
+    └── heatmap.png
 ```
+
+**Tournament / "evolutionary diagnostic".** `tools/tournament.py` loads every
+`league/{predator,prey}/snap_*.pt` and runs each (pred_i, prey_j) pair for K
+episodes. `_elo()` does a few sweeps of standard Elo with score = 1 if mean
+captures > 0, 0.5 if 0, else 0. Asymmetric (predators and prey have separate
+rating scales). Top Elo snapshots are often NOT the latest snapshot — that's
+the diagnostic signal: cycling means later snapshots got specialised to
+counter the league pool, not absolute strength.
+
+**Captures metric.** Logged in `metrics.csv` as `captures` per episode and
+computed in two places: (1) in `run_train.py`'s inner loop, by counting per-
+step prey rewards ≤ -10 (simple_tag awards -10 to prey / +10 to predator per
+collision), and (2) in `tools/tournament.py` the same way. Both rely on the
+simple_tag reward convention; new envs would need a different detector.
 
 `.gitignore` excludes `artifacts/`, `*.mp4`, `*.npz`, `*.csv` — keep generated
 files out of commits.

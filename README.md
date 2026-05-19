@@ -50,12 +50,26 @@ LATEST=$(ls -d artifacts/run_* | tail -n1)
 # Heatmap of per-agent observations over time
 python tools/replay.py "$LATEST/traj" --out "$LATEST/heatmap.mp4" --mode heatmap
 
-# 2D positions, predators red, prey green
-python tools/replay.py "$LATEST/traj" --out "$LATEST/positions.mp4" --mode positions --frameskip 2
+# 2D positions, predators red, prey green; --trail N draws a fading tail
+python tools/replay.py "$LATEST/traj" --out "$LATEST/positions.mp4" --mode positions --frameskip 2 --trail 20
 ```
 
 Position replay requires `recording.enabled: true` in the config (default) so
 that `traj/ep_*.npz` files contain a `pos` array.
+
+## Tournament
+
+Score every (predator snapshot, prey snapshot) pair from a run's league against
+each other, producing a capture-count heatmap and Elo ratings per snapshot per
+team. Useful for detecting non-transitive cycles in the co-adapting league pool.
+
+```bash
+python tools/tournament.py --run artifacts/run_YYYYMMDD_HHMMSS --episodes 3
+# Outputs into artifacts/<run>/tournament/:
+#   scores.csv     # one row per (pred, prey) pair
+#   ratings.csv    # Elo per snapshot per team
+#   heatmap.png    # captures matrix
+```
 
 ## Artifacts
 
@@ -65,7 +79,8 @@ Each `artifacts/run_<UTC timestamp>/` contains:
 - `league/{predator,prey}/snap_*.pt` — frozen snapshots periodically pushed into the league pool.
 - `plots/return.png` — per-team return curves with moving-average overlays.
 - `traj/ep_*.{npz,jsonl}` + `manifest.json` — per-episode recordings (when enabled).
-- `metrics.csv` — episode, per-team returns, PPO loss components, league size.
+- `metrics.csv` — episode, per-team returns, captures, episode length, PPO loss components, league size.
+- `tournament/` — `scores.csv`, `ratings.csv`, `heatmap.png` after running `tools/tournament.py`.
 
 ## Configuration
 

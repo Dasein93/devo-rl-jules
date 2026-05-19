@@ -170,8 +170,11 @@ def _render_episode_positions(
     title_prefix: str = "",
     dpi: int = 120,
     frameskip: int = 1,
+    trail: int = 0,
 ) -> None:
-    """Render one episode as a 2D scatter plot of agent positions."""
+    """Render one episode as a 2D scatter plot of agent positions.
+
+    `trail`: if >0, draw the last `trail` positions per agent as a fading line."""
     T, A, _ = positions.shape
     fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
     world_bounds = [np.min(positions) - 0.1, np.max(positions) + 0.1]
@@ -186,24 +189,37 @@ def _render_episode_positions(
         ax.set_aspect("equal")
         ax.set_title(f"{title_prefix}t={t}", fontsize=10)
 
-        # Predators (red) vs Prey (green)
+        if trail > 0 and t > 0:
+            start = max(0, t - trail)
+            past = positions[start:t + 1]  # (k, A, 2)
+            k = past.shape[0]
+            alphas = np.linspace(0.1, 0.7, max(1, k - 1))
+            for i in range(k - 1):
+                seg = past[i:i + 2]  # (2, A, 2)
+                for j in predator_indices:
+                    ax.plot(seg[:, j, 0], seg[:, j, 1], color="red", alpha=alphas[i], linewidth=1.2)
+                for j in prey_indices:
+                    ax.plot(seg[:, j, 0], seg[:, j, 1], color="green", alpha=alphas[i], linewidth=1.2)
+
         pos_t = positions[t]
         if predator_indices:
-            ax.scatter(pos_t[predator_indices, 0], pos_t[predator_indices, 1], c='r', label="Predators", s=100)
+            ax.scatter(pos_t[predator_indices, 0], pos_t[predator_indices, 1],
+                       c="red", label="Predators", s=120, edgecolors="black", linewidths=0.8)
         if prey_indices:
-            ax.scatter(pos_t[prey_indices, 0], pos_t[prey_indices, 1], c='g', label="Prey", s=100)
+            ax.scatter(pos_t[prey_indices, 0], pos_t[prey_indices, 1],
+                       c="green", label="Prey", s=120, edgecolors="black", linewidths=0.8)
 
-        if t == 0: ax.legend(loc="upper right", fontsize=8)
+        if t == 0:
+            ax.legend(loc="upper right", fontsize=8)
 
-        # No fig.tight_layout() for speed
         fig.canvas.draw()
         rgba_buf = fig.canvas.buffer_rgba()
         w, h = fig.canvas.get_width_height()
         frame_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
         if w % 16 != 0 or h % 16 != 0:
-             w = (w // 16) * 16
-             h = (h // 16) * 16
-             frame_img = frame_img[:h, :w, :]
+            w = (w // 16) * 16
+            h = (h // 16) * 16
+            frame_img = frame_img[:h, :w, :]
         writer.append_data(frame_img)
 
     plt.close(fig)
@@ -216,6 +232,7 @@ def make_video(
     mode: str = "heatmap",
     dpi: int = 120,
     frameskip: int = 1,
+    trail: int = 0,
 ) -> Tuple[int, List[str]]:
     """
     Create an MP4 from a trajectory folder or single .npz.
@@ -237,12 +254,13 @@ def make_video(
             if mode == "positions":
                 try:
                     positions, agent_names = _load_positions_and_names(f)
-                    _render_episode_positions(positions, agent_names, writer, title_prefix=title, dpi=dpi, frameskip=frameskip)
+                    _render_episode_positions(positions, agent_names, writer, title_prefix=title,
+                                              dpi=dpi, frameskip=frameskip, trail=trail)
                 except ValueError as e:
-                    print(f"⚠️  Skipping {f} for position replay: {e}")
+                    print(f"Skipping {f} for position replay: {e}")
                     continue
-            else: # heatmap
-                obs = _load_obs(f)  # (T, A, D)
+            else:  # heatmap
+                obs = _load_obs(f)
                 _render_episode_heatmap(obs, writer, dpi=dpi, title_prefix=title)
             used.append(f)
     finally:
@@ -260,6 +278,8 @@ def main():
                         help="Replay mode: 'heatmap' for obs, 'positions' for 2D scatter")
     parser.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames")
     parser.add_argument("--frameskip", type=int, default=1, help="Render 1 of N frames")
+    parser.add_argument("--trail", type=int, default=0,
+                        help="positions mode only: draw last N positions per agent as a fading trail")
     args = parser.parse_args()
 
     # Rename 'in' to 'trajectory_path' for clarity
@@ -276,6 +296,7 @@ def main():
             mode=args.mode,
             dpi=args.dpi,
             frameskip=args.frameskip,
+            trail=args.trail,
         )
     except Exception as e:
         print(f"[replay] ERROR: {e}")
