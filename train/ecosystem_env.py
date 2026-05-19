@@ -1,11 +1,14 @@
-"""Custom predator/prey ecosystem env with per-agent HP, energy and mortality.
+"""Custom predator/prey ecosystem env with per-agent HP, energy, mortality,
+reproduction, and a food field for prey.
 
 PettingZoo parallel-API compatible. Agent names follow the simple_tag convention
 ("adversary_*" for predators, "agent_*" for prey) so `split_teams` and the
 league / replay tooling work unchanged.
 
-Phase 1 of the ecosystem expansion: no reproduction, no food field, no genome.
-Initial roster is the maximum; agents only leave (death), never join.
+Phases:
+- Phase 1 (mortality only): no reproduction, no food. Population only shrinks.
+- Phase 2 (this file): reproduction in free slots, food field for prey.
+- Phase 3 (TODO): heritable genome mutated on reproduction.
 """
 from __future__ import annotations
 import math
@@ -17,8 +20,12 @@ import numpy as np
 
 @dataclass
 class EcosystemConfig:
+    # Starting populations and maxima. Slots = max_predators + max_prey.
     n_predators_start: int = 10
     n_prey_start: int = 10
+    max_predators: int = 30
+    max_prey: int = 30
+
     world_size: float = 2.0           # world spans [-world_size/2, world_size/2]^2
     max_steps: int = 1000
     max_neighbors_obs: int = 4        # K nearest visible neighbours in obs
@@ -40,13 +47,29 @@ class EcosystemConfig:
     attack_range: float = 0.075
     eat_energy_gain: float = 20.0
 
-    # Energy decay (Phase 1: predators starve, prey do not yet — Phase 2 adds food field)
+    # Energy decay
     pred_energy_cost: float = 0.5
-    prey_energy_cost: float = 0.0
+    prey_energy_cost: float = 0.3     # Phase 2: prey now starve too if they don't forage
+
+    # Food field (only prey forage; covers world in a coarse grid)
+    food_grid_size: int = 16          # NxN cells
+    food_cell_max: float = 10.0
+    food_regen_rate: float = 0.10     # added to every cell each step (capped at food_cell_max)
+    food_eat_rate: float = 5.0        # prey energy gained per step per food unit consumed
+
+    # Reproduction
+    repro_pred_energy_thresh: float = 80.0
+    repro_prey_energy_thresh: float = 70.0
+    repro_min_age: int = 50           # steps an agent must live before it can reproduce
+    repro_cooldown: int = 30          # steps after reproducing before it can again
+    repro_child_hp_frac: float = 1.0  # child starts at this fraction of max_hp
+    repro_child_energy_frac: float = 0.5
+    repro_parent_energy_keep: float = 0.5  # parent keeps this fraction after birth
 
     # Rewards
     reward_per_hit: float = 10.0      # predator gets +reward_per_hit, prey gets -reward_per_hit
     reward_per_death: float = -50.0   # given to the agent that just died this step
+    reward_per_birth: float = 5.0     # given to the parent when a child is spawned
     survival_bonus: float = 0.05      # per step alive
 
     # Boundary (soft penalty when outside [-0.9, 0.9])
@@ -99,28 +122,38 @@ class EcosystemEnv:
                 raise ValueError(f"Unknown ecosystem config key: {k}")
             setattr(self.cfg, k, v)
 
-        self._max_pred = int(self.cfg.n_predators_start)
-        self._max_prey = int(self.cfg.n_prey_start)
+        # Slot allocation: roster size = max_predators + max_prey. Starting
+        # alive count = n_predators_start + n_prey_start; the rest are empty
+        # slots that births can occupy.
+        self._max_pred = int(max(self.cfg.max_predators, self.cfg.n_predators_start))
+        self._max_prey = int(max(self.cfg.max_prey, self.cfg.n_prey_start))
+        self._n_start_pred = int(self.cfg.n_predators_start)
+        self._n_start_prey = int(self.cfg.n_prey_start)
         self._pred_names = [f"adversary_{i}" for i in range(self._max_pred)]
         self._prey_names = [f"agent_{i}" for i in range(self._max_prey)]
         self._all_names = self._pred_names + self._prey_names
 
-        # State arrays sized by max population. Aligned by index: 0..max_pred-1 are
-        # predators, max_pred..max_pred+max_prey-1 are prey.
+        # State arrays sized by max roster.
         N = self._max_pred + self._max_prey
         self._N = N
         self._pos = np.zeros((N, 2), dtype=np.float32)
         self._vel = np.zeros((N, 2), dtype=np.float32)
         self._hp = np.zeros(N, dtype=np.float32)
         self._energy = np.zeros(N, dtype=np.float32)
+        self._age = np.zeros(N, dtype=np.int32)
+        self._cooldown = np.zeros(N, dtype=np.int32)  # steps since last reproduction
         self._alive = np.zeros(N, dtype=bool)
         self._is_pred = np.zeros(N, dtype=bool)
         self._is_pred[: self._max_pred] = True
         self._t = 0
         self._rng = np.random.default_rng(self.cfg.seed)
 
-        # Per-agent obs dim is fixed.
-        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs
+        # Food field for prey foraging.
+        G = self.cfg.food_grid_size
+        self._food = np.full((G, G), self.cfg.food_cell_max, dtype=np.float32)
+
+        # Obs: own (6) + K nearest neighbours (6 each) + own-cell food (1).
+        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs + 1
         self._obs_space = _Box(-np.inf, np.inf, (self._obs_dim,), np.float32)
         self._act_space = _Discrete(5)
 
@@ -144,13 +177,29 @@ class EcosystemEnv:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         half = self.cfg.world_size / 2.0
-        self._pos[:] = self._rng.uniform(-half * 0.8, half * 0.8, size=(self._N, 2)).astype(np.float32)
+
+        # Empty all slots first.
+        self._pos[:] = 0.0
         self._vel[:] = 0.0
-        self._hp[: self._max_pred] = self.cfg.pred_max_hp
-        self._hp[self._max_pred:] = self.cfg.prey_max_hp
-        self._energy[: self._max_pred] = self.cfg.pred_max_energy
-        self._energy[self._max_pred:] = self.cfg.prey_max_energy
-        self._alive[:] = True
+        self._hp[:] = 0.0
+        self._energy[:] = 0.0
+        self._age[:] = 0
+        self._cooldown[:] = 0
+        self._alive[:] = False
+
+        # Spawn the starting roster: first n_start_pred predator slots, first n_start_prey prey slots.
+        pred_start_idx = np.arange(self._n_start_pred)
+        prey_start_idx = np.arange(self._n_start_prey) + self._max_pred
+        for idx_arr, is_pred in ((pred_start_idx, True), (prey_start_idx, False)):
+            self._alive[idx_arr] = True
+            self._pos[idx_arr] = self._rng.uniform(
+                -half * 0.8, half * 0.8, size=(len(idx_arr), 2)
+            ).astype(np.float32)
+            self._hp[idx_arr] = self.cfg.pred_max_hp if is_pred else self.cfg.prey_max_hp
+            self._energy[idx_arr] = self.cfg.pred_max_energy if is_pred else self.cfg.prey_max_energy
+
+        # Refill food grid.
+        self._food[:] = self.cfg.food_cell_max
         self._t = 0
         obs = self._build_obs_dict()
         infos = {a: {} for a in obs}
@@ -185,7 +234,21 @@ class EcosystemEnv:
                     rewards[self._all_names[ip]] += cfg.reward_per_hit
                     rewards[self._all_names[iv]] -= cfg.reward_per_hit
 
-        # 3. Energy decay (predators only in Phase 1).
+        # 3a. Prey foraging from the food field.
+        for i in range(self._max_pred, self._N):
+            if not self._alive[i]:
+                continue
+            gx, gy = self._world_to_grid(self._pos[i])
+            available = float(self._food[gx, gy])
+            eaten = min(available, cfg.food_eat_rate)
+            self._food[gx, gy] -= eaten
+            self._energy[i] = min(self._energy_cap(i), self._energy[i] + eaten)
+
+        # 3b. Food grid regenerates uniformly.
+        self._food += cfg.food_regen_rate
+        np.clip(self._food, 0.0, cfg.food_cell_max, out=self._food)
+
+        # 3c. Energy decay for all alive agents.
         for i in range(self._N):
             if not self._alive[i]:
                 continue
@@ -205,7 +268,9 @@ class EcosystemEnv:
         for name in rewards:
             rewards[name] += cfg.survival_bonus
 
-        # 6. Resolve deaths (HP ≤ 0 OR energy ≤ 0 for predators).
+        # 6. Resolve deaths. Both teams die at HP<=0 OR energy<=0 (Phase 2:
+        # prey can starve too because they now lose energy each step and must
+        # forage to refill).
         terminations = {name: False for name in self.agents}
         for i in range(self._N):
             if not self._alive[i]:
@@ -213,12 +278,23 @@ class EcosystemEnv:
             died = False
             if self._hp[i] <= 0.0:
                 died = True
-            elif self._is_pred[i] and self._energy[i] <= 0.0:
+            elif self._energy[i] <= 0.0:
                 died = True
             if died:
                 rewards[self._all_names[i]] += cfg.reward_per_death
                 self._alive[i] = False
                 terminations[self._all_names[i]] = True
+
+        # 6b. Age + cooldown bookkeeping, then reproduction.
+        for i in range(self._N):
+            if not self._alive[i]:
+                continue
+            self._age[i] += 1
+            if self._cooldown[i] > 0:
+                self._cooldown[i] -= 1
+        births = self._maybe_reproduce(rewards)
+        # Births spawned this step are not present in `terminations` yet; we
+        # still emit obs for them in the next-obs dict.
 
         # 7. Step counter / truncation.
         self._t += 1
@@ -252,6 +328,79 @@ class EcosystemEnv:
             return self._max_pred + int(name.split("_")[1])
         raise KeyError(name)
 
+    def _energy_cap(self, i: int) -> float:
+        return self.cfg.pred_max_energy if self._is_pred[i] else self.cfg.prey_max_energy
+
+    def _hp_cap(self, i: int) -> float:
+        return self.cfg.pred_max_hp if self._is_pred[i] else self.cfg.prey_max_hp
+
+    def _world_to_grid(self, pos: np.ndarray) -> Tuple[int, int]:
+        """Map a 2D world coordinate to (row, col) in the food grid."""
+        G = self.cfg.food_grid_size
+        half = self.cfg.world_size / 2.0
+        # Normalize to [0, 1] then bucket into G cells.
+        u = (float(pos[0]) + half) / max(1e-6, self.cfg.world_size)
+        v = (float(pos[1]) + half) / max(1e-6, self.cfg.world_size)
+        gx = int(np.clip(int(u * G), 0, G - 1))
+        gy = int(np.clip(int(v * G), 0, G - 1))
+        return gx, gy
+
+    def _free_slot(self, is_pred: bool) -> Optional[int]:
+        if is_pred:
+            for i in range(self._max_pred):
+                if not self._alive[i]:
+                    return i
+        else:
+            for i in range(self._max_pred, self._N):
+                if not self._alive[i]:
+                    return i
+        return None
+
+    def _maybe_reproduce(self, rewards: Dict[str, float]) -> List[int]:
+        """Check each alive agent against reproduction triggers; spawn children
+        in free slots. Returns list of newly-spawned slot indices."""
+        cfg = self.cfg
+        births: List[int] = []
+        half = cfg.world_size / 2.0
+        # Snapshot the parents BEFORE any births to avoid the new child instantly
+        # qualifying to reproduce in the same step.
+        candidates = []
+        for i in range(self._N):
+            if not self._alive[i]:
+                continue
+            if self._age[i] < cfg.repro_min_age:
+                continue
+            if self._cooldown[i] > 0:
+                continue
+            thresh = cfg.repro_pred_energy_thresh if self._is_pred[i] else cfg.repro_prey_energy_thresh
+            if self._energy[i] < thresh:
+                continue
+            candidates.append(i)
+
+        for i in candidates:
+            child_slot = self._free_slot(bool(self._is_pred[i]))
+            if child_slot is None:
+                continue  # team is at capacity
+            # Pay reproduction cost.
+            self._energy[i] *= cfg.repro_parent_energy_keep
+            self._cooldown[i] = cfg.repro_cooldown
+
+            # Spawn child near the parent, full HP, partial energy.
+            offset = self._rng.uniform(-0.05, 0.05, size=2).astype(np.float32)
+            self._pos[child_slot] = np.clip(self._pos[i] + offset, -half, half)
+            self._vel[child_slot] = 0.0
+            self._hp[child_slot] = self._hp_cap(child_slot) * cfg.repro_child_hp_frac
+            self._energy[child_slot] = self._energy_cap(child_slot) * cfg.repro_child_energy_frac
+            self._age[child_slot] = 0
+            self._cooldown[child_slot] = cfg.repro_cooldown
+            self._alive[child_slot] = True
+            births.append(child_slot)
+
+            # Reward the parent.
+            rewards[self._all_names[i]] = rewards.get(self._all_names[i], 0.0) + cfg.reward_per_birth
+
+        return births
+
     def _build_obs_dict(self) -> Dict[str, np.ndarray]:
         cfg = self.cfg
         out: Dict[str, np.ndarray] = {}
@@ -284,6 +433,12 @@ class EcosystemEnv:
                     obs[off + 3] = self._vel[j, 1]
                     obs[off + 4] = 1.0 if self._is_pred[j] else 0.0
                     obs[off + 5] = 0.0 if self._is_pred[j] else 1.0
+
+            # Own-cell food scalar (last dim). Predators see it but it conveys
+            # nothing useful for them; cheap to include uniformly.
+            gx, gy = self._world_to_grid(self._pos[i])
+            obs[-1] = float(self._food[gx, gy]) / max(1e-6, cfg.food_cell_max)
+
             out[self._all_names[i]] = obs
         return out
 

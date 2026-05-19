@@ -24,7 +24,8 @@ def test_obs_dim_consistent_across_agents():
     obs, _ = env.reset(seed=0)
     dims = {v.shape[0] for v in obs.values()}
     assert len(dims) == 1
-    assert next(iter(dims)) == 6 + 6 * 4
+    # 6 own + 6*K neighbours + 1 own-cell food
+    assert next(iter(dims)) == 6 + 6 * 4 + 1
 
 
 def test_action_and_observation_space_shapes():
@@ -72,13 +73,13 @@ def test_team_extinction_terminates_episode():
 def test_predator_starves_when_energy_depleted():
     env = make_ecosystem_env(
         seed=0, n_predators_start=1, n_prey_start=1,
+        max_predators=1, max_prey=1,            # pin slot layout
         pred_max_energy=2.0, pred_energy_cost=1.0,
-        attack_range=0.0,  # no collisions → can't refuel
+        attack_range=0.0,                       # no collisions → can't refuel
     )
     env.reset(seed=0)
-    # Place agents far apart so predator can't eat.
-    env._pos[0] = np.array([-0.5, 0.0], dtype=np.float32)
-    env._pos[1] = np.array([0.5, 0.0], dtype=np.float32)
+    env._pos[0] = np.array([-0.5, 0.0], dtype=np.float32)   # adversary_0
+    env._pos[1] = np.array([0.5, 0.0], dtype=np.float32)    # agent_0
     # 2 energy, cost 1/step → starves on step 2 (energy hits 0 on step 2, dies same step).
     for _ in range(5):
         obs, rewards, terms, truncs, infos = env.step({a: 0 for a in env.agents})
@@ -104,12 +105,13 @@ def test_collision_rewards_match_config():
 def test_dead_agent_not_in_subsequent_obs():
     env = make_ecosystem_env(
         seed=0, n_predators_start=1, n_prey_start=2,
-        prey_max_hp=5.0, attack_damage=50.0, attack_range=0.05,  # small range
+        max_predators=1, max_prey=2,           # pin slot layout for this test
+        prey_max_hp=5.0, attack_damage=50.0, attack_range=0.05,
     )
     env.reset(seed=0)
-    env._pos[0] = np.array([0.0, 0.0], dtype=np.float32)   # predator
-    env._pos[1] = np.array([0.001, 0.0], dtype=np.float32) # agent_0 in range → dies
-    env._pos[2] = np.array([0.5, 0.5], dtype=np.float32)   # agent_1 out of range → survives
+    env._pos[0] = np.array([0.0, 0.0], dtype=np.float32)    # predator (adversary_0)
+    env._pos[1] = np.array([0.001, 0.0], dtype=np.float32)  # agent_0 in range → dies
+    env._pos[2] = np.array([0.5, 0.5], dtype=np.float32)    # agent_1 out of range → survives
     obs, rewards, terms, truncs, infos = env.step({a: 0 for a in env.agents})
     assert "agent_0" not in obs, "Dead prey should not appear in next obs"
     assert "agent_1" in obs, "Surviving prey should still be observable"

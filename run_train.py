@@ -75,7 +75,12 @@ def _step(env, actions):
 
 
 def _team_obs_dim(agents: List[str], obs_dict: Dict[str, np.ndarray]) -> int:
-    return max(int(np.size(obs_dict[a])) for a in agents)
+    """Maximum obs vector size across `agents` that are present in `obs_dict`.
+    Agents in the roster but missing from obs (unborn or dead) are skipped."""
+    sizes = [int(np.size(obs_dict[a])) for a in agents if a in obs_dict]
+    if not sizes:
+        raise ValueError("No team agents are present in obs_dict")
+    return max(sizes)
 
 
 def _pad(vec: np.ndarray, dim: int) -> np.ndarray:
@@ -190,7 +195,13 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                    max_cycles=max_steps, seed=seed,
                    ecosystem_overrides=ecosystem_overrides)
     obs0 = _reset(env, seed=seed)
-    agents = sorted(obs0.keys())
+    # Use possible_agents when the env exposes it (ecosystem env's full slot
+    # roster includes "ghost" agents that may be born mid-episode). Fall back
+    # to whoever is in the initial obs (simple_tag has a fixed roster).
+    if hasattr(env, "possible_agents") and env.possible_agents:
+        agents = sorted(env.possible_agents)
+    else:
+        agents = sorted(obs0.keys())
     pred_agents, prey_agents = split_teams(agents)
     if not pred_agents or not prey_agents:
         raise RuntimeError(f"Need at least one predator and one prey; got pred={pred_agents}, prey={prey_agents}")

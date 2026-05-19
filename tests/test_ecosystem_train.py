@@ -65,7 +65,10 @@ def test_ecosystem_recorder_alive_mask(tmpdir):
             "max_steps": 50,
             "n_predators": 3,
             "n_prey": 3,
-            "ecosystem": {"prey_max_hp": 10.0, "attack_damage": 20.0, "attack_range": 0.2},
+            "ecosystem": {
+                "max_predators": 3, "max_prey": 3,  # disable reproduction by capping at start
+                "prey_max_hp": 10.0, "attack_damage": 20.0, "attack_range": 0.2,
+            },
         },
         "train": {"total_episodes": 2, "lr": 1e-4, "hidden": 32, "centralized_critic": False},
         "league": {"enabled": False},
@@ -90,7 +93,8 @@ def test_ecosystem_recorder_alive_mask(tmpdir):
     pos = data["pos"]
     assert alive.shape[0] == pos.shape[0]
     assert alive.shape[1] == pos.shape[1] == 6
-    # The alive count should be monotonically non-increasing (Phase 1: no births).
+    # With reproduction disabled (max == start) and damaging predators, alive count
+    # should be monotonically non-increasing.
     counts = alive.sum(axis=1)
     assert all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1)), \
-        f"Alive count should monotonically decrease in Phase 1; got {counts}"
+        f"Alive count should monotonically decrease when reproduction is off; got {counts}"
