@@ -12,7 +12,9 @@ Predator–prey co-evolution sandbox on PettingZoo MPE `simple_tag_v3`:
 - **League of frozen snapshots** (`train/league.py`) — periodic snapshots of each
   team's policy are sampled as opponents during rollouts to stabilise co-adaptation.
 - **GAE** with value-loss clipping and gradient clipping.
-- **Trajectory recording + replay** to MP4 (heatmap or 2D scatter).
+- **Trajectory recording + replay** to MP4 (heatmap, positions+trails, or ecosystem split-panel).
+- **Two envs**: `mpe.simple_tag_v3` (PettingZoo) and `ecosystem` (`train/ecosystem_env.py`).
+  Choice driven by `env.id` in the config.
 
 ## Commands
 
@@ -46,10 +48,15 @@ python tools/compare_runs.py --runs artifacts/run_A artifacts/run_B \
 python -m pytest -q
 python -m pytest tests/test_ppo.py::test_gae_terminal_zeros_bootstrap -v
 
+# Train on the custom ecosystem env (mortality, reproduction, food field).
+python run_train.py --config configs/ecosystem.yaml --episodes 300 --device cpu
+
 # Replay. `in` is a POSITIONAL argument; do NOT pass it as --in.
 # Multi-episode directories are sorted by integer ep index, not alphabetically.
 python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode heatmap
 python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode positions --frameskip 2 --trail 20
+# Ecosystem split panel (2D scene + population-over-time curve, agents wink in/out):
+python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode ecosystem --frameskip 2 --trail 20
 ```
 
 `tests/test_replay_positions.py` invokes `run_train.py` and `tools/replay.py` via
@@ -133,6 +140,21 @@ simple_tag's observation layout. Other envs would need their own extractor.
 convention; new envs would need a different scheme (and `split_teams` would
 need to be generalised).
 
+**Ecosystem env (`train/ecosystem_env.py`).** Custom PettingZoo-parallel-API
+env. Per-agent HP, energy, age, reproduction cooldown. Predators eat prey
+(prey HP -= damage, predator energy += food); both teams starve at energy 0
+and die at HP 0. Prey forage from a coarse food grid (`food_grid_size`)
+that regenerates each step. Reproduction triggers on (age > min, cooldown
+== 0, energy ≥ team threshold) and spawns a child in a free slot. The
+roster has `max_predators + max_prey` slots total; `n_*_start` agents are
+alive at reset, the rest fill in via births. Agent names follow the
+simple_tag convention (`adversary_*`, `agent_*`) so `split_teams`, league,
+tournament, and replay code all work unchanged. The trainer uses
+`env.possible_agents` to know the full slot roster; `done_any` in
+`_step()` is now driven by `truncations` (episode-level) rather than
+`terminations` (per-agent death) — this distinction is what lets the
+ecosystem env have agents die mid-episode without ending the episode.
+
 **Artifacts layout.**
 
 ```
@@ -141,7 +163,12 @@ artifacts/run_<UTC timestamp>/
 ├── league/{predator,prey}/snap_*.pt    # frozen snapshots
 ├── plots/return.png                    # per-team return curves
 ├── traj/ep_*.{npz,jsonl} + manifest.json
-├── metrics.csv                         # ep, returns, captures, ep_steps, losses, league sizes
+│                                       # NPZ now also has `alive (T,A) bool`;
+│                                       # ecosystem episodes include `pos (T,A,2)`
+│                                       # from obs[0:2], with NaN for dead slots.
+├── metrics.csv                         # ep, returns, captures, ep_steps,
+│                                       # pred_pop_end/_mean, prey_pop_end/_mean,
+│                                       # losses, league sizes
 └── tournament/                         # written by tools/tournament.py
     ├── scores.csv                      # pair-wise captures, episode length, returns
     ├── ratings.csv                     # Elo per snapshot per team

@@ -10,14 +10,20 @@ Predator–prey digital evolution + RL sandbox on PettingZoo MPE `simple_tag_v3`
 - **Evolutionary league** — past policy snapshots are sampled as opponents during rollouts, stabilising the co-adaptation between the two teams.
 - **GAE, value-loss clipping, gradient clipping** in PPO.
 - **Trajectory recording** with per-step positions for offline replay.
+- **Two envs**: PettingZoo `simple_tag_v3` (fixed roster, no death) and a custom
+  `ecosystem` env (per-agent HP / energy, mortality, reproduction, food field).
+  Switch via `env.id` in the config — `configs/base.yaml` vs `configs/ecosystem.yaml`.
 
 ## Quickstart
 
 ```bash
 pip install -r requirements.txt
 
-# CPU
+# CPU on the classic simple_tag env
 python run_train.py --config configs/base.yaml --episodes 200 --device cpu
+
+# CPU on the ecosystem env (mortality + reproduction + food field)
+python run_train.py --config configs/ecosystem.yaml --episodes 300 --device cpu
 
 # GPU (Colab/RunPod)
 python run_train.py --config configs/base.yaml --episodes 1000 --device cuda
@@ -54,6 +60,10 @@ python tools/replay.py "$LATEST/traj" --out "$LATEST/heatmap.mp4" --mode heatmap
 
 # 2D positions, predators red, prey green; --trail N draws a fading tail
 python tools/replay.py "$LATEST/traj" --out "$LATEST/positions.mp4" --mode positions --frameskip 2 --trail 20
+
+# Ecosystem split panel — 2D scene with agents winking in/out next to an
+# animated population-over-time curve. Requires the `ecosystem` env.
+python tools/replay.py "$LATEST/traj" --out "$LATEST/ecosystem.mp4" --mode ecosystem --frameskip 2 --trail 20
 ```
 
 Position replay requires `recording.enabled: true` in the config (default) so

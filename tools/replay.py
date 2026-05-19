@@ -98,6 +98,18 @@ def _load_positions_and_names(npz_path: str) -> Tuple[np.ndarray, List[str]]:
         return pos, names
 
 
+def _load_pos_alive_names(npz_path: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Like _load_positions_and_names but also returns the (T, A) alive mask
+    for the ecosystem replay. If no 'alive' key is present, defaults to all-True."""
+    with np.load(npz_path, allow_pickle=True) as data:
+        pos, names = _load_positions_and_names(npz_path)
+        if "alive" in data:
+            alive = np.asarray(data["alive"], dtype=bool)
+        else:
+            alive = np.ones(pos.shape[:2], dtype=bool)
+        return pos, alive, names
+
+
 def _normalize_for_visual(obs_t: np.ndarray) -> np.ndarray:
     """
     Normalize a single time-step obs (A, D) to [0,1] per-feature-window for heatmap.
@@ -225,6 +237,122 @@ def _render_episode_positions(
     plt.close(fig)
 
 
+def _render_episode_ecosystem(
+    positions: np.ndarray,
+    alive: np.ndarray,
+    agent_names: List[str],
+    writer: imageio.FFMPEGWriter,
+    pop_pred_global: np.ndarray,
+    pop_prey_global: np.ndarray,
+    cumulative_offset: int,
+    title_prefix: str = "",
+    dpi: int = 120,
+    frameskip: int = 1,
+    trail: int = 0,
+) -> None:
+    """Render one ecosystem episode as a split panel.
+
+    Left: 2D scatter of currently-alive predators (red) and prey (green),
+    with a fading trail for each alive agent.
+    Right: population-over-time line plot covering ALL episodes so far,
+    with a marker at the current global step.
+
+    `pop_pred_global` / `pop_prey_global` are the full multi-episode
+    population time series (concatenated across episodes). `cumulative_offset`
+    is the global step index at the start of this episode.
+    """
+    T, A, _ = positions.shape
+    predator_idx = [i for i, n in enumerate(agent_names) if "adversary" in str(n)]
+    prey_idx = [i for i, n in enumerate(agent_names) if "adversary" not in str(n)]
+
+    # World bounds: use the bounding box over all *alive* positions, plus a margin.
+    alive_pos = positions[alive]
+    if alive_pos.size > 0:
+        lo = float(np.nanmin(alive_pos)) - 0.1
+        hi = float(np.nanmax(alive_pos)) + 0.1
+    else:
+        lo, hi = -1.0, 1.0
+    world_bounds = (lo, hi)
+
+    fig, (ax_world, ax_pop) = plt.subplots(1, 2, figsize=(11, 5), dpi=dpi,
+                                           gridspec_kw={"width_ratios": [1.1, 1.4]})
+
+    pop_max = max(int(pop_pred_global.max()), int(pop_prey_global.max()), 1)
+    n_global = len(pop_pred_global)
+
+    for t in range(0, T, frameskip):
+        # --- Left panel: world ---
+        ax_world.clear()
+        ax_world.set_xlim(world_bounds)
+        ax_world.set_ylim(world_bounds)
+        ax_world.set_aspect("equal")
+        ax_world.set_title(f"{title_prefix}t={t}", fontsize=10)
+
+        pred_alive_now = [i for i in predator_idx if alive[t, i]]
+        prey_alive_now = [i for i in prey_idx if alive[t, i]]
+        n_pred_now = len(pred_alive_now)
+        n_prey_now = len(prey_alive_now)
+
+        if trail > 0 and t > 0:
+            start = max(0, t - trail)
+            past = positions[start:t + 1]            # (k, A, 2)
+            past_alive = alive[start:t + 1]          # (k, A) — only draw segments where agent is alive
+            k = past.shape[0]
+            alphas = np.linspace(0.1, 0.55, max(1, k - 1))
+            for i in range(k - 1):
+                # Draw a line segment for each agent alive at both endpoints.
+                both_alive = past_alive[i] & past_alive[i + 1]
+                seg = past[i:i + 2]                  # (2, A, 2)
+                for j in predator_idx:
+                    if both_alive[j]:
+                        ax_world.plot(seg[:, j, 0], seg[:, j, 1],
+                                       color="red", alpha=alphas[i], linewidth=1.0)
+                for j in prey_idx:
+                    if both_alive[j]:
+                        ax_world.plot(seg[:, j, 0], seg[:, j, 1],
+                                       color="green", alpha=alphas[i], linewidth=1.0)
+
+        pos_t = positions[t]
+        if pred_alive_now:
+            xs = pos_t[pred_alive_now, 0]; ys = pos_t[pred_alive_now, 1]
+            ax_world.scatter(xs, ys, c="red", s=100, edgecolors="black", linewidths=0.6,
+                              label=f"Predators ({n_pred_now})")
+        if prey_alive_now:
+            xs = pos_t[prey_alive_now, 0]; ys = pos_t[prey_alive_now, 1]
+            ax_world.scatter(xs, ys, c="green", s=100, edgecolors="black", linewidths=0.6,
+                              label=f"Prey ({n_prey_now})")
+        ax_world.legend(loc="upper right", fontsize=8)
+        ax_world.set_xticks([]); ax_world.set_yticks([])
+
+        # --- Right panel: population curves (global, with current marker) ---
+        ax_pop.clear()
+        x = np.arange(n_global)
+        ax_pop.plot(x, pop_pred_global, color="red", linewidth=1.0, label="Predators")
+        ax_pop.plot(x, pop_prey_global, color="green", linewidth=1.0, label="Prey")
+        cur = cumulative_offset + t
+        ax_pop.axvline(cur, color="black", linewidth=0.8, alpha=0.5)
+        ax_pop.set_xlim(0, max(1, n_global - 1))
+        ax_pop.set_ylim(0, pop_max + 2)
+        ax_pop.set_xlabel("global step")
+        ax_pop.set_ylabel("population")
+        ax_pop.set_title("Population over training", fontsize=10)
+        ax_pop.legend(loc="upper right", fontsize=8)
+        ax_pop.grid(alpha=0.3)
+
+        fig.tight_layout()
+        fig.canvas.draw()
+        rgba_buf = fig.canvas.buffer_rgba()
+        w, h = fig.canvas.get_width_height()
+        frame_img = np.frombuffer(rgba_buf, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+        if w % 16 != 0 or h % 16 != 0:
+            w = (w // 16) * 16
+            h = (h // 16) * 16
+            frame_img = frame_img[:h, :w, :]
+        writer.append_data(frame_img)
+
+    plt.close(fig)
+
+
 def make_video(
     trajectory_path: str,
     out_mp4: str,
@@ -248,6 +376,35 @@ def make_video(
     writer = imageio.get_writer(out_mp4, fps=fps, codec="libx264", bitrate="8000k", quality=8)
     used = []
 
+    # For ecosystem mode, build the global population time series up-front so
+    # the right panel can show "where we are in training" alongside each frame.
+    pop_pred_global = None
+    pop_prey_global = None
+    ep_offsets = None
+    if mode == "ecosystem":
+        pop_pred_runs = []
+        pop_prey_runs = []
+        ep_offsets = []
+        running = 0
+        for f in npz_files:
+            try:
+                _pos, _alive, names = _load_pos_alive_names(f)
+            except ValueError as e:
+                print(f"Skipping {f} for ecosystem replay: {e}")
+                continue
+            pred_idx_local = [i for i, n in enumerate(names) if "adversary" in str(n)]
+            prey_idx_local = [i for i, n in enumerate(names) if "adversary" not in str(n)]
+            pp = _alive[:, pred_idx_local].sum(axis=1)
+            qq = _alive[:, prey_idx_local].sum(axis=1)
+            pop_pred_runs.append(pp)
+            pop_prey_runs.append(qq)
+            ep_offsets.append(running)
+            running += len(pp)
+        if not pop_pred_runs:
+            raise FileNotFoundError(f"No ecosystem-compatible npz files in {trajectory_path}")
+        pop_pred_global = np.concatenate(pop_pred_runs)
+        pop_prey_global = np.concatenate(pop_prey_runs)
+
     try:
         for idx, f in enumerate(npz_files, start=1):
             title = f"Episode {idx}/{len(npz_files)} — {os.path.basename(f)} "
@@ -258,6 +415,19 @@ def make_video(
                                               dpi=dpi, frameskip=frameskip, trail=trail)
                 except ValueError as e:
                     print(f"Skipping {f} for position replay: {e}")
+                    continue
+            elif mode == "ecosystem":
+                try:
+                    positions, alive, agent_names = _load_pos_alive_names(f)
+                    _render_episode_ecosystem(
+                        positions, alive, agent_names, writer,
+                        pop_pred_global=pop_pred_global,
+                        pop_prey_global=pop_prey_global,
+                        cumulative_offset=ep_offsets[idx - 1] if ep_offsets else 0,
+                        title_prefix=title, dpi=dpi, frameskip=frameskip, trail=trail,
+                    )
+                except ValueError as e:
+                    print(f"Skipping {f} for ecosystem replay: {e}")
                     continue
             else:  # heatmap
                 obs = _load_obs(f)
@@ -274,8 +444,10 @@ def main():
     parser.add_argument("in", help="Path to trajectory .npz or folder")
     parser.add_argument("--out", type=str, default="replay.mp4", help="Output MP4 file path")
     parser.add_argument("--fps", type=int, default=12, help="Frames per second")
-    parser.add_argument("--mode", type=str, choices=["heatmap", "positions"], default="heatmap",
-                        help="Replay mode: 'heatmap' for obs, 'positions' for 2D scatter")
+    parser.add_argument("--mode", type=str,
+                        choices=["heatmap", "positions", "ecosystem"], default="heatmap",
+                        help="Replay mode: 'heatmap' for obs, 'positions' for 2D scatter, "
+                             "'ecosystem' for split-panel (2D scene + population curve)")
     parser.add_argument("--dpi", type=int, default=120, help="DPI for rendering frames")
     parser.add_argument("--frameskip", type=int, default=1, help="Render 1 of N frames")
     parser.add_argument("--trail", type=int, default=0,
