@@ -106,6 +106,15 @@ timestep of each rollout effectively assumes terminal; combined with the
 per-step `done` mask this gives the standard GAE behaviour for episodic
 rollouts.
 
+**Known GAE quirk.** The trainer interleaves agents within each timestep
+(`obs[k]` for k in `[t*A, (t+1)*A)` are the A agents at step t), and GAE walks
+that flat sequence as if every row were a time transition. Because rewards and
+dones are replicated per-step and (with MAPPO) values are also per-step shared,
+within-step deltas are degenerate while step-boundary deltas are correct. The
+system still learns well in practice; a future cleanup would maintain
+per-agent rollout sequences and compute GAE separately for each, then
+concatenate.
+
 **Trajectory recording.** `TrajectoryRecorder` writes per-episode
 `ep_<i>.{jsonl,npz}` and a run-level `manifest.json`. NPZ layout is now
 `obs (T, A, D)`, `act (T, A)`, optional `pos (T, A, 2)`, plus `agent_names (A,)`
