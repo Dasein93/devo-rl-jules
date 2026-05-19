@@ -1,0 +1,88 @@
+seed: 42
+device: cpu
+
+env:
+  id: ecosystem
+  max_steps: 1500          # longer episodes so cycles have room to play out
+  n_predators: 10
+  n_prey: 10
+  ecosystem:
+    max_predators: 40
+    max_prey: 40
+    # Combat
+    pred_max_hp: 100.0
+    pred_max_energy: 80.0   # lower cap so predators are more dependent on regular food
+    pred_speed: 0.05
+    pred_sense_radius: 0.6
+    prey_max_hp: 30.0
+    prey_max_energy: 100.0
+    prey_speed: 0.065
+    prey_sense_radius: 0.6
+    attack_damage: 15.0
+    attack_range: 0.075
+    eat_energy_gain: 30.0   # bigger boost per catch
+    # Energy — predators starve in ~80 steps without food, prey ~330 steps
+    pred_energy_cost: 1.0
+    prey_energy_cost: 0.3
+    # Food — slower regen so prey can't trivially rebound everywhere
+    food_grid_size: 16
+    food_cell_max: 8.0
+    food_regen_rate: 0.05
+    food_eat_rate: 5.0
+    # Reproduction — shorter generations + lower thresholds for faster turnover
+    repro_pred_energy_thresh: 55.0
+    repro_prey_energy_thresh: 50.0
+    repro_min_age: 20
+    repro_cooldown: 15
+    repro_child_hp_frac: 1.0
+    repro_child_energy_frac: 0.5
+    repro_parent_energy_keep: 0.5
+    # Rewards
+    reward_per_hit: 10.0
+    reward_per_death: -50.0
+    reward_per_birth: 5.0
+    survival_bonus: 0.05
+    boundary_threshold: 0.9
+    boundary_penalty: 5.0
+    max_neighbors_obs: 4
+    # Genome
+    genome_enabled: true
+    genome_init_sigma: 0.08
+    mutation_sigma: 0.05
+    genome_min: 0.5
+    genome_max: 2.0
+
+train:
+  algo: ppo
+  total_episodes: 1000
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  minibatch_size: 1024
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128
+  centralized_critic: false
+
+# Keep the league as a small influence rather than removing it — it stabilises
+# co-adaptation. opponent_prob lowered so raw ecology has room to play out.
+league:
+  enabled: true
+  snapshot_every: 25
+  opponent_prob: 0.1
+  max_snapshots: 30
+
+logging:
+  save_dir: artifacts/
+  plot_every: 50
+
+checkpoint:
+  enabled: true
+  every: 250
+
+recording:
+  enabled: true
+  sample_rate: 1

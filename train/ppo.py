@@ -1,15 +1,21 @@
+"""PPO with GAE, separate-policy support, and trajectory recording.
 
+`PPO` is a single shared-policy learner over a fixed obs/action shape.
+`run_train.py` instantiates one PPO per team (predators, prey).
+"""
 import os, json
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Union, Optional
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+
 def set_seed(seed: int):
     import random, numpy as _np, torch as _torch
     random.seed(seed); _np.random.seed(seed); _torch.manual_seed(seed)
+
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 128):
@@ -17,168 +23,321 @@ class MLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(hidden, out_dim),
         )
-    def forward(self, x): return self.net(x)
+
+    def forward(self, x):
+        return self.net(x)
+
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+    """Actor takes per-agent observations; critic can take either per-agent obs
+    (decentralised, classic PPO) or a centralised state (MAPPO).
+
+    `state_dim=None` (default) → critic is fed obs, equivalent to standard PPO.
+    `state_dim>0`               → critic input dimension; caller is responsible for
+                                  providing a `state` tensor to `step()` / `value()`.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128,
+                 state_dim: Optional[int] = None):
         super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden = hidden
+        self.state_dim = int(state_dim) if state_dim else obs_dim
         self.actor = MLP(obs_dim, act_dim, hidden)
-        self.critic = MLP(obs_dim, 1, hidden)
-    def step(self, obs: torch.Tensor):
+        self.critic = MLP(self.state_dim, 1, hidden)
+
+    def value(self, state: torch.Tensor) -> torch.Tensor:
+        return self.critic(state).squeeze(-1)
+
+    def act(self, obs: torch.Tensor, deterministic: bool = False):
+        """Actor-only forward — for opponent rollouts where the critic is
+        unused and the state shape would otherwise mismatch."""
         logits = self.actor(obs)
         dist = torch.distributions.Categorical(logits=logits)
-        a = dist.sample()
+        a = logits.argmax(-1) if deterministic else dist.sample()
         logp = dist.log_prob(a)
-        v = self.critic(obs).squeeze(-1)
+        return a, logp
+
+    def step(self, obs: torch.Tensor, state: Optional[torch.Tensor] = None,
+             deterministic: bool = False):
+        a, logp = self.act(obs, deterministic=deterministic)
+        v = self.value(state if state is not None else obs)
         return a, logp, v
+
 
 @dataclass
 class PPOConfig:
     lr: float = 3e-4
     gamma: float = 0.99
+    gae_lambda: float = 0.95
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     update_epochs: int = 4
-    batch_size: int = 2048
+    minibatch_size: int = 1024
     hidden: int = 128
+    max_grad_norm: float = 0.5
+
 
 class PPO:
-    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu"):
+    """Single-policy PPO. Caller is responsible for filtering transitions
+    to those belonging to the policy being updated (e.g. one team).
+
+    Pass `state_dim` to enable a centralised critic (MAPPO). Then the caller
+    must supply `states` to `update()` and pre-computed `vals` from
+    `ActorCritic.value(state)` rather than from observations."""
+
+    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu",
+                 state_dim: Optional[int] = None):
         self.cfg = cfg
         self.device = device
-        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden).to(device)
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.state_dim = int(state_dim) if state_dim else obs_dim
+        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden, state_dim=self.state_dim).to(device)
         self.opt = optim.Adam(self.ac.parameters(), lr=cfg.lr)
 
-    def save(self, path, episode, returns):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
+    def save(self, path: str, episode: int, returns: list, extra: Optional[dict] = None):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        payload = {
             "episode": episode,
             "returns": returns,
             "ac_state_dict": self.ac.state_dict(),
             "opt_state_dict": self.opt.state_dict(),
-        }, path)
+            "obs_dim": self.obs_dim,
+            "act_dim": self.act_dim,
+            "state_dim": self.state_dim,
+            "hidden": self.cfg.hidden,
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
 
-    def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.ac.load_state_dict(ckpt["ac_state_dict"])
         self.opt.load_state_dict(ckpt["opt_state_dict"])
         return ckpt["episode"], ckpt["returns"]
 
-    def _compute_returns(self, rews, dones, values, gamma):
-        n = len(rews); out = [0.0]*n; G = 0.0
-        for i in range(n-1, -1, -1):
-            G = float(rews[i]) + gamma * G * (1.0 - float(dones[i]))
-            out[i] = G
-        return torch.tensor(out, dtype=torch.float32).to(self.device)
-
-    def update(self, obs, acts, logps, rews, dones, vals):
+    @staticmethod
+    def _gae(rews, dones, vals, gamma, lam):
+        """Returns (advantages, returns). All inputs/outputs are flat 1D over time steps.
+        Bootstraps with V=0 at episode end (per-step `dones` already encodes terminal)."""
         n = len(rews)
-        assert n>0 and len(acts)==n and len(logps)==n and len(vals)==n and len(obs)==n and len(dones)==n, \
+        adv = np.zeros(n, dtype=np.float32)
+        last_gae = 0.0
+        for t in range(n - 1, -1, -1):
+            nonterminal = 1.0 - float(dones[t])
+            next_v = float(vals[t + 1]) if t + 1 < n else 0.0
+            delta = float(rews[t]) + gamma * next_v * nonterminal - float(vals[t])
+            last_gae = delta + gamma * lam * nonterminal * last_gae
+            adv[t] = last_gae
+        rets = adv + np.asarray(vals, dtype=np.float32)
+        return adv, rets
+
+    def update(self, obs, acts, logps, rews, dones, vals, states=None) -> Dict[str, float]:
+        """Compute GAE from the supplied (rews, dones, vals) and run PPO update.
+        Use `update_precomputed` directly if you want to compute GAE yourself
+        (e.g. per-agent rollouts that must not have GAE bleed across boundaries)."""
+        n = len(obs)
+        if n == 0:
+            return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+        assert len(acts) == n and len(logps) == n and len(vals) == n and len(rews) == n and len(dones) == n, \
             f"Buffer mismatch: {len(obs)=} {len(acts)=} {len(logps)=} {len(rews)=} {len(dones)=} {len(vals)=}"
+        adv_np, rets_np = self._gae(rews, dones, vals, self.cfg.gamma, self.cfg.gae_lambda)
+        return self.update_precomputed(obs, acts, logps, vals, adv_np, rets_np, states=states)
+
+    def update_precomputed(self, obs, acts, logps, vals, advs, rets, states=None) -> Dict[str, float]:
+        """PPO update with caller-supplied advantages and returns. Use this when
+        rollouts span multiple independent sequences (e.g. per-agent buffers)
+        and the caller computed GAE on each sequence separately."""
+        n = len(obs)
+        if n == 0:
+            return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+        assert len(acts) == n and len(logps) == n and len(vals) == n and len(advs) == n and len(rets) == n, \
+            f"Buffer mismatch: {len(obs)=} {len(acts)=} {len(logps)=} {len(vals)=} {len(advs)=} {len(rets)=}"
         cfg = self.cfg
-        obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device)
-        acts = torch.tensor(np.array(acts), dtype=torch.int64).to(self.device)
-        old_logps = torch.tensor(np.array(logps), dtype=torch.float32).to(self.device)
-        vals = torch.tensor(np.array(vals), dtype=torch.float32).to(self.device)
-        rets = self._compute_returns(rews, dones, vals, cfg.gamma)
-        adv = (rets - vals); adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=self.device)
+        acts_t = torch.as_tensor(np.asarray(acts), dtype=torch.int64, device=self.device)
+        old_logps = torch.as_tensor(np.asarray(logps), dtype=torch.float32, device=self.device)
+        old_vals = torch.as_tensor(np.asarray(vals), dtype=torch.float32, device=self.device)
+        adv = torch.as_tensor(np.asarray(advs), dtype=torch.float32, device=self.device)
+        rets_t = torch.as_tensor(np.asarray(rets), dtype=torch.float32, device=self.device)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        if states is None:
+            state_t = obs_t
+        else:
+            assert len(states) == n, f"states length {len(states)} != obs length {n}"
+            state_t = torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device)
 
         idx = np.arange(n)
+        pg_acc = v_acc = ent_acc = 0.0
+        n_batches = 0
         for _ in range(cfg.update_epochs):
             np.random.shuffle(idx)
-            for start in range(0, n, 1024):
-                b = idx[start:start+1024]
-                o,a,ol,ad,rt = obs[b], acts[b], old_logps[b], adv[b], rets[b]
+            for start in range(0, n, cfg.minibatch_size):
+                b = idx[start:start + cfg.minibatch_size]
+                o, s, a, ol, ad, rt, ov = (
+                    obs_t[b], state_t[b], acts_t[b],
+                    old_logps[b], adv[b], rets_t[b], old_vals[b],
+                )
                 logits = self.ac.actor(o)
                 dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(a)
                 ratio = (logp - ol).exp()
-                clip_adv = torch.clamp(ratio, 1-cfg.clip_coef, 1+cfg.clip_coef) * ad
-                pg_loss = -(torch.min(ratio*ad, clip_adv)).mean()
-                v = self.ac.critic(o).squeeze(-1)
-                v_loss = 0.5 * (rt - v).pow(2).mean() * cfg.vf_coef
-                ent = dist.entropy().mean() * cfg.ent_coef
-                loss = pg_loss + v_loss - ent
-                self.opt.zero_grad(); loss.backward(); self.opt.step()
+                clip_adv = torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef) * ad
+                pg_loss = -(torch.min(ratio * ad, clip_adv)).mean()
+
+                v_pred = self.ac.value(s)
+                v_clip = ov + (v_pred - ov).clamp(-cfg.clip_coef, cfg.clip_coef)
+                v_loss = 0.5 * torch.max((v_pred - rt).pow(2), (v_clip - rt).pow(2)).mean()
+
+                ent = dist.entropy().mean()
+                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
+                self.opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.ac.parameters(), cfg.max_grad_norm)
+                self.opt.step()
+
+                pg_acc += pg_loss.item()
+                v_acc += v_loss.item()
+                ent_acc += ent.item()
+                n_batches += 1
+
+        return {
+            "pg_loss": pg_acc / max(1, n_batches),
+            "v_loss": v_acc / max(1, n_batches),
+            "entropy": ent_acc / max(1, n_batches),
+            "samples": n,
+        }
+
 
 class TrajectoryRecorder:
-    def __init__(self, save_dir: str, env_id: str, env_cfg: dict, global_seed: int, agent_names: list, rec_cfg: Dict = {}):
+    """Records per-episode trajectories to {npz, jsonl} and a run-level manifest.json.
+
+    NPZ layout: obs (T, A, D), act (T, A), pos (T, A, 2) when env supports it, agent_names (A,).
+    """
+
+    def __init__(self, save_dir: str, env_id: str, env_cfg: dict, global_seed: int,
+                 agent_names: list, rec_cfg: Optional[Dict] = None):
+        rec_cfg = rec_cfg or {}
         self.run_dir = save_dir
         self.sample_rate = int(rec_cfg.get("sample_rate", 1))
         os.makedirs(self.run_dir, exist_ok=True)
-        self.step_obs: list = []
-        self.step_acts: list = []
-        self.step_pos: list = []
-        self.buffer: list = []
+        self.step_obs: list = []   # list of per-step (A, D_pad) arrays
+        self.step_acts: list = []  # list of per-step (A,) arrays
+        self.step_pos: list = []   # list of per-step (A, 2) arrays
+        self.step_alive: list = []  # list of per-step (A,) bool arrays — True when agent was alive
+        self.step_genome: list = []  # list of per-step (A, G) arrays, only for ecosystem
+        self.buffer: list = []     # JSONL records
 
         self.env_id = env_id
         self.env_cfg = env_cfg
         self.global_seed = global_seed
-        self.agent_names = agent_names
-        self.episode_seeds = []
+        self.agent_names = list(agent_names)
+        self.episode_seeds: list = []
 
-    def record_step(self, t, agent_id, obs, act, rew, done, info):
-        # For JSONL
-        self.buffer.append({
-            "t": t, "agent_id": agent_id, "obs": obs.tolist(), "act": act,
-            "rew": rew, "done": done, "info": info,
-        })
-        # For NPZ
-        self.step_obs.append(obs)
-        self.step_acts.append(act)
+    def _pad_row(self, vec, target_len):
+        v = np.asarray(vec, dtype=np.float32).ravel()
+        if v.size < target_len:
+            v = np.concatenate([v, np.zeros(target_len - v.size, dtype=np.float32)])
+        elif v.size > target_len:
+            v = v[:target_len]
+        return v
 
-    def record_step_positions(self, obs_dict: Dict[str, np.ndarray]):
-        if "simple_tag" not in self.env_id: return
-        # obs_dict is {agent_id: obs_vec}
-        # self.agent_names is sorted, so we must iterate in that order
+    def record_step(self, t, obs_dict, acts_dict, rewards_dict, done_any, infos, genome_by_agent=None):
+        # Per-agent JSONL records — only for currently-alive agents (those in obs_dict).
         for agent_id in self.agent_names:
-            self.step_pos.append(obs_dict[agent_id][2:4])
+            if agent_id not in obs_dict:
+                continue
+            self.buffer.append({
+                "t": t, "agent_id": agent_id,
+                "obs": np.asarray(obs_dict[agent_id]).tolist(),
+                "act": int(acts_dict.get(agent_id, -1)),
+                "rew": float(rewards_dict.get(agent_id, 0.0)),
+                "done": bool(done_any),
+                "info": infos.get(agent_id, {}),
+            })
 
-    def _pad_and_stack(self, obs_list):
-        import numpy as np
-        max_len = max(int(np.size(o)) for o in obs_list)
-        padded = []
-        for o in obs_list:
-            a = np.asarray(o, dtype=np.float32).ravel()
-            if a.size < max_len:
-                a = np.concatenate([a, np.zeros(max_len - a.size, dtype=np.float32)], axis=0)
-            padded.append(a)
-        return np.stack(padded, axis=0).astype(np.float32)
+        # Per-step (A, D) arrays — fixed-roster, padded for dead agents.
+        present = [a for a in self.agent_names if a in obs_dict]
+        if present:
+            max_d = max(int(np.size(obs_dict[a])) for a in present)
+        else:
+            max_d = 1
+        row_obs = np.zeros((len(self.agent_names), max_d), dtype=np.float32)
+        row_acts = np.full(len(self.agent_names), -1, dtype=np.int64)
+        row_alive = np.zeros(len(self.agent_names), dtype=bool)
+        for k, a in enumerate(self.agent_names):
+            if a in obs_dict:
+                row_obs[k] = self._pad_row(obs_dict[a], max_d)
+                row_acts[k] = int(acts_dict.get(a, -1))
+                row_alive[k] = True
+        self.step_obs.append(row_obs)
+        self.step_acts.append(row_acts)
+        self.step_alive.append(row_alive)
+
+        # Position extraction. Two cases:
+        # (a) simple_tag: obs[2:4] is (x, y). Apply to alive agents; dead → NaN.
+        # (b) ecosystem: obs[0:2] is (x, y).
+        if "simple_tag" in self.env_id or self.env_id == "ecosystem":
+            pos_offset = 0 if self.env_id == "ecosystem" else 2
+            row_pos = np.full((len(self.agent_names), 2), np.nan, dtype=np.float32)
+            for k, a in enumerate(self.agent_names):
+                if a in obs_dict:
+                    row_pos[k] = np.asarray(obs_dict[a], dtype=np.float32)[pos_offset:pos_offset + 2]
+            self.step_pos.append(row_pos)
+
+        # Optional per-agent genome capture (ecosystem env only).
+        if genome_by_agent:
+            G = next(iter(genome_by_agent.values())).shape[0]
+            row_g = np.full((len(self.agent_names), G), np.nan, dtype=np.float32)
+            for k, a in enumerate(self.agent_names):
+                if a in genome_by_agent:
+                    row_g[k] = genome_by_agent[a]
+            self.step_genome.append(row_g)
 
     def save(self, episode_idx: int, episode_seed: int):
-        if not self.buffer: return
+        if not self.buffer:
+            return
         self.episode_seeds.append(episode_seed)
-
         path_base = os.path.join(self.run_dir, f"ep_{episode_idx}")
 
-        # JSONL
         with open(f"{path_base}.jsonl", "w") as f:
-            for item in self.buffer: f.write(json.dumps(item) + "\n")
+            for item in self.buffer:
+                f.write(json.dumps(item) + "\n")
 
-        # NPZ
-        n_agents = len(self.agent_names)
-        obs_mat = self._pad_and_stack(self.step_obs)
-        act_mat = np.array(self.step_acts, dtype=np.int64).reshape(-1, n_agents)
-
-        save_payload = {"obs": obs_mat, "act": act_mat, "agent_names": self.agent_names}
-
+        max_d = max(r.shape[1] for r in self.step_obs)
+        obs_padded = [np.pad(r, ((0, 0), (0, max_d - r.shape[1]))) for r in self.step_obs]
+        obs_mat = np.stack(obs_padded, axis=0).astype(np.float32)  # (T, A, D)
+        act_mat = np.stack(self.step_acts, axis=0)                 # (T, A)
+        payload = {
+            "obs": obs_mat,
+            "act": act_mat,
+            "agent_names": np.asarray(self.agent_names),
+        }
+        if self.step_alive:
+            payload["alive"] = np.stack(self.step_alive, axis=0)   # (T, A) bool
         if self.step_pos:
-            pos_mat = np.array(self.step_pos, dtype=np.float32).reshape(-1, n_agents, 2)
-            save_payload["pos"] = pos_mat
+            payload["pos"] = np.stack(self.step_pos, axis=0).astype(np.float32)  # (T, A, 2)
+        if self.step_genome:
+            payload["genome"] = np.stack(self.step_genome, axis=0).astype(np.float32)  # (T, A, G)
 
-        np.savez_compressed(f"{path_base}.npz", **save_payload)
+        np.savez_compressed(f"{path_base}.npz", **payload)
 
-        # Clear buffers
         self.buffer.clear()
         self.step_obs.clear()
         self.step_acts.clear()
         self.step_pos.clear()
+        self.step_alive.clear()
+        self.step_genome.clear()
 
     def save_manifest(self):
-        # NOTE: we save one manifest.json, not manifest.jsonl
         agent_roles = ["predator" if "adversary" in name else "prey" for name in self.agent_names]
         manifest = {
             "env_id": self.env_id,
@@ -191,10 +350,12 @@ class TrajectoryRecorder:
         with open(os.path.join(self.run_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
 
+
 def flatten_obs(obs_in: Union[Dict[str, np.ndarray], tuple]) -> Tuple[np.ndarray, List[str]]:
     o = obs_in
     while isinstance(o, tuple):
-        if len(o)==0: raise ValueError("Empty tuple observations")
+        if len(o) == 0:
+            raise ValueError("Empty tuple observations")
         o = o[0]
     if not isinstance(o, dict):
         raise TypeError(f"Expected dict, got {type(o)}")
@@ -203,3 +364,10 @@ def flatten_obs(obs_in: Union[Dict[str, np.ndarray], tuple]) -> Tuple[np.ndarray
     m = max(v.size for v in vecs)
     padded = [np.pad(v, (0, m - v.size)) for v in vecs]
     return np.stack(padded, axis=0), agents
+
+
+def split_teams(agent_names: List[str]) -> Tuple[List[str], List[str]]:
+    """Predators ('adversary' in name) vs prey. Order preserved from input."""
+    pred = [a for a in agent_names if "adversary" in a]
+    prey = [a for a in agent_names if "adversary" not in a]
+    return pred, prey

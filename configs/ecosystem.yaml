@@ -1,0 +1,82 @@
+seed: 42
+device: cpu
+
+env:
+  id: ecosystem
+  max_steps: 1000
+  # Starting populations; the roster has room to grow up to max_predators / max_prey
+  # via reproduction.
+  n_predators: 10
+  n_prey: 10
+  ecosystem:
+    max_predators: 30
+    max_prey: 30
+    # Combat
+    pred_max_hp: 100.0
+    pred_max_energy: 100.0
+    pred_speed: 0.05
+    pred_sense_radius: 0.6
+    prey_max_hp: 30.0
+    prey_max_energy: 100.0
+    prey_speed: 0.065
+    prey_sense_radius: 0.6
+    attack_damage: 15.0
+    attack_range: 0.075
+    eat_energy_gain: 20.0
+    # Energy
+    pred_energy_cost: 0.4
+    prey_energy_cost: 0.3
+    # Food field
+    food_grid_size: 16
+    food_cell_max: 10.0
+    food_regen_rate: 0.10
+    food_eat_rate: 5.0
+    # Reproduction
+    repro_pred_energy_thresh: 80.0
+    repro_prey_energy_thresh: 70.0
+    repro_min_age: 50
+    repro_cooldown: 30
+    repro_child_hp_frac: 1.0
+    repro_child_energy_frac: 0.5
+    repro_parent_energy_keep: 0.5
+    # Rewards
+    reward_per_hit: 10.0
+    reward_per_death: -50.0
+    reward_per_birth: 5.0
+    survival_bonus: 0.05
+    boundary_threshold: 0.9
+    boundary_penalty: 5.0
+    max_neighbors_obs: 4
+
+train:
+  algo: ppo
+  total_episodes: 200
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  minibatch_size: 1024
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128
+  centralized_critic: false   # Phase 1: keep decentralised; MAPPO with dynamic pop is Phase 2
+
+league:
+  enabled: true
+  snapshot_every: 25
+  opponent_prob: 0.3
+  max_snapshots: 20
+
+logging:
+  save_dir: artifacts/
+  plot_every: 25
+
+checkpoint:
+  enabled: true
+  every: 100
+
+recording:
+  enabled: true
+  sample_rate: 1

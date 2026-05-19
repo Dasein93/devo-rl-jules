@@ -1,4 +1,15 @@
 # Run Log
-| date (UTC) | episodes | mean return (last 10) | config | notes |
-|---|---:|---:|---|---|
-| 2025-08-26 | — | — | configs/base.yaml | Colab quickstart |
+
+| date (UTC) | episodes | pred return (last 10) | prey return (last 10) | config | notes |
+|---|---:|---:|---:|---|---|
+| 2025-08-26 | — | — | — | configs/base.yaml | Colab quickstart bootstrap |
+| 2026-05-19 | 60 | +23.0 | -503.1 | configs/base.yaml | Smoke test of per-team PPO + league (snapshot_every=25) |
+| 2026-05-19 | 150 | +87.0 | -262.0 | configs/base.yaml | Preview run; 6 league snaps/team; tournament Elo cycle: top pred = ep25, pred_ep150 vs prey_ep25 → 0 captures |
+| 2026-05-19 | 50  | +38.0 | -178.6 | configs/base.yaml (centralized_critic: true) | MAPPO smoke; ~4× faster pred return at ep50 vs decentralised (+38 vs +10) |
+| 2026-05-19 | 600 | +154.0 | -162.7 | configs/base.yaml (centralized_critic: true) | MAPPO long run with 20-snapshot league; top Elo: pred ep550 (1811), prey ep400 (1425) |
+| 2026-05-19 | 600 | +106.0 | -150.9 | dec config (centralized_critic: false) | Decentralised PPO baseline at same seed; MAPPO wins on pred return by ~45% averaged across training |
+| 2026-05-19 | 2500 | +273.0 | -858.9 | MAPPO + 100-snapshot league (interleaved GAE) | 100 generations. Phase-transition around ep 1900-2200: pred peaks at +355, prey crashes to -1561. Predator side broke out of league equilibrium. Tournament on every-5th-gen subsample (20×20): top Elo pred = ep875 (1841), top Elo prey = ep1250 (1303) — neither is the latest snapshot, confirming non-transitive co-evolution. |
+| 2026-05-19 | 600 | +209.0 | -163.9 | MAPPO + league (per-agent GAE) | Same seed and config as the 24-gen MAPPO above (+154 / -163). Per-agent GAE buffer fix gives +36% pred return at episode 600 with prey return unchanged. Lead established at ep 50 (+134 vs +38) and held throughout. Tournament (20×20): top Elo pred = ep125 (1848, the earliest snapshot), top Elo prey = ep450 (1292) — early predator generalises better across the prey league than any specialised late snapshot. |
+| 2026-05-19 | 300 | +4.2 / -34.6 | n/a | Ecosystem env (mortality + reproduction + food field), MAPPO off | First training run on the new custom env. Population dynamics: prey mean pop 21 (early) → 8.5 (mid) → 7.7 (late); captures 74 → 22 → 25; episode length 764 → 254 → 269 steps. Predators learn to hunt; prey population crashes ~60%. Late episodes show partial prey recovery — soft Lotka-Volterra signal. League snapshots: 11 per team. |
+| 2026-05-19 | 500 | -1.4 / -36.0 | n/a | Ecosystem env, genome enabled (Phase 3) | Heritable traits drift over training: predators ↑ on all three traits (speed +0.007, HP +0.013, sense +0.001); prey ↓ (speed -0.026, HP -0.030, sense -0.022). Modest in 500 episodes but consistent direction per team — pure mutation noise would show no consistent sign. Population: prey mean pop 12.8 → 7.9 (-38%); pred mean pop steady at 12. League snapshots: 19 per team. |
+| 2026-05-19 | 1000 | -16.4 / -41.4 | n/a | ecosystem_lv config (Lotka-Volterra tuned) | Tuning hit. Pop ranges per-episode mean: predator [6, 19], prey [4, 34] — a 7× spread in prey count across the run. Three episode-scale pendulum swings in the last 200 eps (predator-favoured → prey-favoured at ep 850 → back). Predator traits drift +4% to +7% on speed/HP/sense by the end (much larger than 500-ep run, since predators reproduce more aggressively under the new energy economy). Total captures across the run: 15,684. League at the FIFO cap of 30 snapshots. |
