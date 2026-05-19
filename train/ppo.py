@@ -31,20 +31,40 @@ class MLP(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+    """Actor takes per-agent observations; critic can take either per-agent obs
+    (decentralised, classic PPO) or a centralised state (MAPPO).
+
+    `state_dim=None` (default) → critic is fed obs, equivalent to standard PPO.
+    `state_dim>0`               → critic input dimension; caller is responsible for
+                                  providing a `state` tensor to `step()` / `value()`.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128,
+                 state_dim: Optional[int] = None):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.hidden = hidden
+        self.state_dim = int(state_dim) if state_dim else obs_dim
         self.actor = MLP(obs_dim, act_dim, hidden)
-        self.critic = MLP(obs_dim, 1, hidden)
+        self.critic = MLP(self.state_dim, 1, hidden)
 
-    def step(self, obs: torch.Tensor, deterministic: bool = False):
+    def value(self, state: torch.Tensor) -> torch.Tensor:
+        return self.critic(state).squeeze(-1)
+
+    def act(self, obs: torch.Tensor, deterministic: bool = False):
+        """Actor-only forward — for opponent rollouts where the critic is
+        unused and the state shape would otherwise mismatch."""
         logits = self.actor(obs)
         dist = torch.distributions.Categorical(logits=logits)
         a = logits.argmax(-1) if deterministic else dist.sample()
         logp = dist.log_prob(a)
-        v = self.critic(obs).squeeze(-1)
+        return a, logp
+
+    def step(self, obs: torch.Tensor, state: Optional[torch.Tensor] = None,
+             deterministic: bool = False):
+        a, logp = self.act(obs, deterministic=deterministic)
+        v = self.value(state if state is not None else obs)
         return a, logp, v
 
 
@@ -64,14 +84,20 @@ class PPOConfig:
 
 class PPO:
     """Single-policy PPO. Caller is responsible for filtering transitions
-    to those belonging to the policy being updated (e.g. one team)."""
+    to those belonging to the policy being updated (e.g. one team).
 
-    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu"):
+    Pass `state_dim` to enable a centralised critic (MAPPO). Then the caller
+    must supply `states` to `update()` and pre-computed `vals` from
+    `ActorCritic.value(state)` rather than from observations."""
+
+    def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu",
+                 state_dim: Optional[int] = None):
         self.cfg = cfg
         self.device = device
         self.obs_dim = obs_dim
         self.act_dim = act_dim
-        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden).to(device)
+        self.state_dim = int(state_dim) if state_dim else obs_dim
+        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden, state_dim=self.state_dim).to(device)
         self.opt = optim.Adam(self.ac.parameters(), lr=cfg.lr)
 
     def save(self, path: str, episode: int, returns: list, extra: Optional[dict] = None):
@@ -83,6 +109,7 @@ class PPO:
             "opt_state_dict": self.opt.state_dict(),
             "obs_dim": self.obs_dim,
             "act_dim": self.act_dim,
+            "state_dim": self.state_dim,
             "hidden": self.cfg.hidden,
         }
         if extra:
@@ -111,7 +138,7 @@ class PPO:
         rets = adv + np.asarray(vals, dtype=np.float32)
         return adv, rets
 
-    def update(self, obs, acts, logps, rews, dones, vals) -> Dict[str, float]:
+    def update(self, obs, acts, logps, rews, dones, vals, states=None) -> Dict[str, float]:
         n = len(obs)
         if n == 0:
             return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
@@ -128,6 +155,12 @@ class PPO:
         rets = torch.as_tensor(rets_np, dtype=torch.float32, device=self.device)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
+        if states is None:
+            state_t = obs_t
+        else:
+            assert len(states) == n, f"states length {len(states)} != obs length {n}"
+            state_t = torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device)
+
         idx = np.arange(n)
         pg_acc = v_acc = ent_acc = 0.0
         n_batches = 0
@@ -135,7 +168,10 @@ class PPO:
             np.random.shuffle(idx)
             for start in range(0, n, cfg.minibatch_size):
                 b = idx[start:start + cfg.minibatch_size]
-                o, a, ol, ad, rt, ov = obs_t[b], acts_t[b], old_logps[b], adv[b], rets[b], old_vals[b]
+                o, s, a, ol, ad, rt, ov = (
+                    obs_t[b], state_t[b], acts_t[b],
+                    old_logps[b], adv[b], rets[b], old_vals[b],
+                )
                 logits = self.ac.actor(o)
                 dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(a)
@@ -143,7 +179,7 @@ class PPO:
                 clip_adv = torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef) * ad
                 pg_loss = -(torch.min(ratio * ad, clip_adv)).mean()
 
-                v_pred = self.ac.critic(o).squeeze(-1)
+                v_pred = self.ac.value(s)
                 v_clip = ov + (v_pred - ov).clamp(-cfg.clip_coef, cfg.clip_coef)
                 v_loss = 0.5 * torch.max((v_pred - rt).pow(2), (v_clip - rt).pow(2)).mean()
 

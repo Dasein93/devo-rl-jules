@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Predator–prey co-evolution sandbox on PettingZoo MPE `simple_tag_v3`:
 
 - **Per-team PPO** (`train/ppo.py`) — one policy per team, separate optimizers/replay.
+- **Optional MAPPO-style centralised critic** (`train.centralized_critic` flag) —
+  each team's critic sees the concatenation of all its own agents' observations.
 - **League of frozen snapshots** (`train/league.py`) — periodic snapshots of each
   team's policy are sampled as opponents during rollouts to stabilise co-adaptation.
 - **GAE** with value-loss clipping and gradient clipping.
@@ -35,6 +37,10 @@ python tools/eval.py \
 # Tournament: round-robin between all league snapshots → captures heatmap + Elo.
 python tools/tournament.py --run artifacts/run_YYYYMMDD_HHMMSS --episodes 3
 
+# Compare ablation runs (overlay metric across multiple runs).
+python tools/compare_runs.py --runs artifacts/run_A artifacts/run_B \
+  --labels A B --metric pred_return --out compare.png
+
 # Tests — use `python -m pytest`, not `pytest`, because the system-wide `pytest`
 # is a separate uv-managed install that does not see the project requirements.
 python -m pytest -q
@@ -58,6 +64,19 @@ team with potentially different `obs_dim`, and runs them in parallel. Per-step
 rewards are aggregated as the per-team mean and replicated across that team's
 agents before going into the buffer; only the team's own samples update its
 policy.
+
+**Centralised critic (MAPPO).** Toggled by `train.centralized_critic: true`.
+`ActorCritic.__init__` takes a `state_dim` parameter; when set, the critic
+takes a flattened concatenation of all team agents' observations (shape
+`team_size * pad_obs_dim`) instead of per-agent obs. The actor is unchanged.
+During rollouts the trainer builds the team state via `_team_state(team_obs)`
+and passes it to `_act_team(..., state=...)`, which returns a *shared* value
+replicated across the team's agents. The buffer carries a `states` list
+alongside `obs`; `PPO.update(..., states=...)` uses it to recompute v_pred.
+**Opponents (league snapshots) are routed through `_act_team_actor_only`**
+because their saved critic may have a different `state_dim` than the live
+trainer — calling `.step()` on them would crash with a shape mismatch.
+Checkpoints persist `state_dim`; `ActorCritic` and `League._load` honour it.
 
 **League / "digital evolution".** `train/league.py` holds a FIFO pool of
 `ActorCritic` state dicts on disk under `league/{predator,prey}/snap_*.pt`. At

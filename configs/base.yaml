@@ -20,6 +20,9 @@ train:
   vf_coef: 0.5
   max_grad_norm: 0.5
   hidden: 128
+  # MAPPO-style centralised critic: each team's critic sees the concatenation
+  # of all its own agents' observations. Actor still sees per-agent obs only.
+  centralized_critic: true
 
 league:
   enabled: true

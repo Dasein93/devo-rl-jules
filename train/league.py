@@ -49,6 +49,7 @@ class League:
             "obs_dim": ac.obs_dim,
             "act_dim": ac.act_dim,
             "hidden": ac.hidden,
+            "state_dim": ac.state_dim,
             "episode": episode,
         }
         torch.save(payload, path)
@@ -76,7 +77,12 @@ class League:
 
     def _load(self, path: str) -> ActorCritic:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        ac = ActorCritic(ckpt["obs_dim"], ckpt["act_dim"], ckpt["hidden"]).to(self.device)
+        ac = ActorCritic(
+            obs_dim=ckpt["obs_dim"],
+            act_dim=ckpt["act_dim"],
+            hidden=ckpt["hidden"],
+            state_dim=ckpt.get("state_dim"),
+        ).to(self.device)
         ac.load_state_dict(ckpt["ac_state_dict"])
         ac.eval()
         for p in ac.parameters():

@@ -25,7 +25,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from train.ppo import PPO, PPOConfig, ActorCritic, split_teams, set_seed
-from run_train import make_env, _reset, _step, _stack_team, _team_obs_dim, _act_team
+from run_train import make_env, _reset, _step, _stack_team, _team_obs_dim, _act_team_actor_only
 
 
 def _expand_glob(path: Optional[str]) -> Optional[str]:
@@ -38,10 +38,17 @@ def _expand_glob(path: Optional[str]) -> Optional[str]:
 
 
 def _load_actor(ckpt_path: Optional[str], obs_dim: int, act_dim: int, hidden: int, device: str) -> ActorCritic:
-    ac = ActorCritic(obs_dim, act_dim, hidden).to(device)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ac = ActorCritic(
+            obs_dim=ckpt.get("obs_dim", obs_dim),
+            act_dim=ckpt.get("act_dim", act_dim),
+            hidden=ckpt.get("hidden", hidden),
+            state_dim=ckpt.get("state_dim"),
+        ).to(device)
         ac.load_state_dict(ckpt["ac_state_dict"])
+    else:
+        ac = ActorCritic(obs_dim, act_dim, hidden).to(device)
     ac.eval()
     for p in ac.parameters():
         p.requires_grad_(False)
@@ -81,8 +88,8 @@ def evaluate(pred_ckpt: Optional[str], prey_ckpt: Optional[str], episodes: int,
         while not done_any:
             pred_obs = _stack_team(pred_agents, obs, pred_obs_dim)
             prey_obs = _stack_team(prey_agents, obs, prey_obs_dim)
-            pa, _, _ = _act_team(pred_ac, pred_obs, device, deterministic=deterministic)
-            ya, _, _ = _act_team(prey_ac, prey_obs, device, deterministic=deterministic)
+            pa, _ = _act_team_actor_only(pred_ac, pred_obs, device, deterministic=deterministic)
+            ya, _ = _act_team_actor_only(prey_ac, prey_obs, device, deterministic=deterministic)
             acts = {}
             for i, a in enumerate(pred_agents): acts[a] = int(pa[i])
             for i, a in enumerate(prey_agents): acts[a] = int(ya[i])

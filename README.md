@@ -5,6 +5,8 @@
 Predator–prey digital evolution + RL sandbox on PettingZoo MPE `simple_tag_v3`.
 
 - **Per-team PPO** — one policy for predators, one for prey, trained jointly.
+- **MAPPO-style centralised critic** — each team's critic sees the concatenation
+  of all its own agents' observations (gated by `train.centralized_critic`).
 - **Evolutionary league** — past policy snapshots are sampled as opponents during rollouts, stabilising the co-adaptation between the two teams.
 - **GAE, value-loss clipping, gradient clipping** in PPO.
 - **Trajectory recording** with per-step positions for offline replay.
@@ -56,6 +58,22 @@ python tools/replay.py "$LATEST/traj" --out "$LATEST/positions.mp4" --mode posit
 
 Position replay requires `recording.enabled: true` in the config (default) so
 that `traj/ep_*.npz` files contain a `pos` array.
+
+## Comparing runs
+
+Overlay learning curves from multiple runs — useful for ablations (MAPPO on/off,
+league on/off, hyperparameter sweeps).
+
+```bash
+python tools/compare_runs.py \
+  --runs artifacts/run_mappo artifacts/run_dec \
+  --labels MAPPO Decentralised \
+  --metric pred_return \
+  --out compare.png
+```
+
+`--metric` is any column from `metrics.csv` (`pred_return`, `prey_return`,
+`captures`, `ep_steps`, `pred_v_loss`, ...).
 
 ## Tournament
 

@@ -6,7 +6,7 @@ of frozen snapshots is sampled as the opponent to stabilise co-adaptation.
 """
 import os, csv, argparse, glob
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import yaml
 import numpy as np
@@ -70,12 +70,38 @@ def _stack_team(agents: List[str], obs_dict: Dict[str, np.ndarray], dim: int) ->
     return np.stack([_pad(obs_dict[a], dim) for a in agents], axis=0)
 
 
-def _act_team(ac: ActorCritic, obs_arr: np.ndarray, device: str, deterministic: bool = False):
-    if obs_arr.shape[0] == 0:
+def _team_state(team_obs: np.ndarray) -> np.ndarray:
+    """Flatten a per-team obs matrix (A, D) into a single state vector (A*D,)."""
+    return team_obs.reshape(-1)
+
+
+def _act_team(ac: ActorCritic, obs_arr: np.ndarray, device: str,
+              state: Optional[np.ndarray] = None, deterministic: bool = False):
+    """Returns (acts, logps, vals). If `state` is provided it goes to the centralised
+    critic and the returned v is a single shared value replicated across agents.
+    If `state` is None, vals come from per-agent obs (decentralised PPO)."""
+    n = obs_arr.shape[0]
+    if n == 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.float32), np.array([], dtype=np.float32)
     with torch.no_grad():
-        a, logp, v = ac.step(torch.from_numpy(obs_arr).to(device), deterministic=deterministic)
-    return a.cpu().numpy(), logp.cpu().numpy(), v.cpu().numpy()
+        o = torch.from_numpy(obs_arr).to(device)
+        if state is None:
+            a, logp, v = ac.step(o, deterministic=deterministic)
+            return a.cpu().numpy(), logp.cpu().numpy(), v.cpu().numpy()
+        a, logp = ac.act(o, deterministic=deterministic)
+        s = torch.from_numpy(np.asarray(state, dtype=np.float32)).to(device).unsqueeze(0)
+        shared_v = ac.value(s).item()
+        return a.cpu().numpy(), logp.cpu().numpy(), np.full(n, shared_v, dtype=np.float32)
+
+
+def _act_team_actor_only(ac: ActorCritic, obs_arr: np.ndarray, device: str,
+                         deterministic: bool = False):
+    """For league opponents: returns only (acts, logps); never touches the critic."""
+    if obs_arr.shape[0] == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+    with torch.no_grad():
+        a, logp = ac.act(torch.from_numpy(obs_arr).to(device), deterministic=deterministic)
+    return a.cpu().numpy(), logp.cpu().numpy()
 
 
 def _plot_returns(plots_dir: str, pred_ret: List[float], prey_ret: List[float], window: int):
@@ -163,8 +189,13 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         hidden=int(tcfg.get("hidden", 128)),
         max_grad_norm=float(tcfg.get("max_grad_norm", 0.5)),
     )
-    ppo_pred = PPO(pred_obs_dim, act_dim, ppo_cfg, device=device)
-    ppo_prey = PPO(prey_obs_dim, act_dim, ppo_cfg, device=device)
+    centralized = bool(tcfg.get("centralized_critic", False))
+    pred_state_dim = pred_obs_dim * len(pred_agents) if centralized else None
+    prey_state_dim = prey_obs_dim * len(prey_agents) if centralized else None
+    ppo_pred = PPO(pred_obs_dim, act_dim, ppo_cfg, device=device, state_dim=pred_state_dim)
+    ppo_prey = PPO(prey_obs_dim, act_dim, ppo_cfg, device=device, state_dim=prey_state_dim)
+    if centralized:
+        print(f"Centralised critic enabled: pred_state_dim={pred_state_dim}, prey_state_dim={prey_state_dim}")
 
     lcfg = cfg.get("league", {})
     league_enabled = bool(lcfg.get("enabled", True))
@@ -227,8 +258,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         train_pred = opp_pred is None
         train_prey = opp_prey is None
 
-        pred_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": []}
-        prey_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": []}
+        pred_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": [], "states": []}
+        prey_buf = {"obs": [], "acts": [], "logps": [], "vals": [], "rews": [], "dones": [], "states": []}
         ep_pred_ret = 0.0
         ep_prey_ret = 0.0
         captures = 0
@@ -238,9 +269,21 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         while not done_any:
             pred_obs = _stack_team(pred_agents, obs, pred_obs_dim)
             prey_obs = _stack_team(prey_agents, obs, prey_obs_dim)
+            pred_state = _team_state(pred_obs) if centralized else None
+            prey_state = _team_state(prey_obs) if centralized else None
 
-            pa, plogp, pv = _act_team(pred_actor, pred_obs, device)
-            ya, ylogp, yv = _act_team(prey_actor, prey_obs, device)
+            # Trained team: full step (actor + critic). Opponent (league snapshot):
+            # actor only, since its critic shape may not match our centralised state.
+            if train_pred:
+                pa, plogp, pv = _act_team(pred_actor, pred_obs, device, state=pred_state)
+            else:
+                pa, plogp = _act_team_actor_only(pred_actor, pred_obs, device)
+                pv = np.zeros(len(pred_agents), dtype=np.float32)
+            if train_prey:
+                ya, ylogp, yv = _act_team(prey_actor, prey_obs, device, state=prey_state)
+            else:
+                ya, ylogp = _act_team_actor_only(prey_actor, prey_obs, device)
+                yv = np.zeros(len(prey_agents), dtype=np.float32)
 
             acts = {}
             for i, a in enumerate(pred_agents): acts[a] = int(pa[i])
@@ -260,9 +303,10 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                 pred_buf["acts"].extend(pa.tolist())
                 pred_buf["logps"].extend(plogp.tolist())
                 pred_buf["vals"].extend(pv.tolist())
-                # per-agent rew/done, replicated across team size
                 pred_buf["rews"].extend([pred_step_rew] * len(pred_agents))
                 pred_buf["dones"].extend([float(done_any)] * len(pred_agents))
+                if centralized:
+                    pred_buf["states"].extend([pred_state] * len(pred_agents))
             if train_prey:
                 prey_buf["obs"].extend(prey_obs)
                 prey_buf["acts"].extend(ya.tolist())
@@ -270,6 +314,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                 prey_buf["vals"].extend(yv.tolist())
                 prey_buf["rews"].extend([prey_step_rew] * len(prey_agents))
                 prey_buf["dones"].extend([float(done_any)] * len(prey_agents))
+                if centralized:
+                    prey_buf["states"].extend([prey_state] * len(prey_agents))
 
             if recorder and t % recorder.sample_rate == 0:
                 recorder.record_step(t, obs, acts, rewards, done_any, infos)
@@ -280,8 +326,15 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         if recorder:
             recorder.save(ep, episode_seed=(seed + ep))
 
-        pred_stats = ppo_pred.update(**pred_buf) if train_pred else {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
-        prey_stats = ppo_prey.update(**prey_buf) if train_prey else {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+        def _update(ppo_, buf, train_flag):
+            if not train_flag:
+                return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+            kwargs = {k: v for k, v in buf.items() if k != "states"}
+            kwargs["states"] = buf["states"] if centralized and buf["states"] else None
+            return ppo_.update(**kwargs)
+
+        pred_stats = _update(ppo_pred, pred_buf, train_pred)
+        prey_stats = _update(ppo_prey, prey_buf, train_prey)
 
         pred_returns.append(ep_pred_ret / max(1, len(pred_agents)))
         prey_returns.append(ep_prey_ret / max(1, len(prey_agents)))
