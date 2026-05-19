@@ -233,6 +233,7 @@ class TrajectoryRecorder:
         self.step_acts: list = []  # list of per-step (A,) arrays
         self.step_pos: list = []   # list of per-step (A, 2) arrays
         self.step_alive: list = []  # list of per-step (A,) bool arrays — True when agent was alive
+        self.step_genome: list = []  # list of per-step (A, G) arrays, only for ecosystem
         self.buffer: list = []     # JSONL records
 
         self.env_id = env_id
@@ -249,7 +250,7 @@ class TrajectoryRecorder:
             v = v[:target_len]
         return v
 
-    def record_step(self, t, obs_dict, acts_dict, rewards_dict, done_any, infos):
+    def record_step(self, t, obs_dict, acts_dict, rewards_dict, done_any, infos, genome_by_agent=None):
         # Per-agent JSONL records — only for currently-alive agents (those in obs_dict).
         for agent_id in self.agent_names:
             if agent_id not in obs_dict:
@@ -292,6 +293,15 @@ class TrajectoryRecorder:
                     row_pos[k] = np.asarray(obs_dict[a], dtype=np.float32)[pos_offset:pos_offset + 2]
             self.step_pos.append(row_pos)
 
+        # Optional per-agent genome capture (ecosystem env only).
+        if genome_by_agent:
+            G = next(iter(genome_by_agent.values())).shape[0]
+            row_g = np.full((len(self.agent_names), G), np.nan, dtype=np.float32)
+            for k, a in enumerate(self.agent_names):
+                if a in genome_by_agent:
+                    row_g[k] = genome_by_agent[a]
+            self.step_genome.append(row_g)
+
     def save(self, episode_idx: int, episode_seed: int):
         if not self.buffer:
             return
@@ -315,6 +325,8 @@ class TrajectoryRecorder:
             payload["alive"] = np.stack(self.step_alive, axis=0)   # (T, A) bool
         if self.step_pos:
             payload["pos"] = np.stack(self.step_pos, axis=0).astype(np.float32)  # (T, A, 2)
+        if self.step_genome:
+            payload["genome"] = np.stack(self.step_genome, axis=0).astype(np.float32)  # (T, A, G)
 
         np.savez_compressed(f"{path_base}.npz", **payload)
 
@@ -323,6 +335,7 @@ class TrajectoryRecorder:
         self.step_acts.clear()
         self.step_pos.clear()
         self.step_alive.clear()
+        self.step_genome.clear()
 
     def save_manifest(self):
         agent_roles = ["predator" if "adversary" in name else "prey" for name in self.agent_names]

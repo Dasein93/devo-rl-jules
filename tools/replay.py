@@ -20,7 +20,7 @@ import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 def _episode_index(path: str) -> int:
@@ -108,6 +108,14 @@ def _load_pos_alive_names(npz_path: str) -> Tuple[np.ndarray, np.ndarray, List[s
         else:
             alive = np.ones(pos.shape[:2], dtype=bool)
         return pos, alive, names
+
+
+def _load_genome(npz_path: str) -> Optional[np.ndarray]:
+    """Load (T, A, G) genome array if present, else None."""
+    with np.load(npz_path, allow_pickle=True) as data:
+        if "genome" not in data:
+            return None
+        return np.asarray(data["genome"], dtype=np.float32)
 
 
 def _normalize_for_visual(obs_t: np.ndarray) -> np.ndarray:
@@ -249,6 +257,7 @@ def _render_episode_ecosystem(
     dpi: int = 120,
     frameskip: int = 1,
     trail: int = 0,
+    genome: Optional[np.ndarray] = None,
 ) -> None:
     """Render one ecosystem episode as a split panel.
 
@@ -313,13 +322,34 @@ def _render_episode_ecosystem(
                                        color="green", alpha=alphas[i], linewidth=1.0)
 
         pos_t = positions[t]
+
+        def _sizes_and_alphas(idxs: List[int]):
+            """For each agent index, return (marker size, marker alpha) based on
+            its genome at this timestep. Defaults if no genome data."""
+            if genome is None:
+                return [100] * len(idxs), [0.9] * len(idxs)
+            g_now = genome[t, idxs]   # (n, G), G >= 2
+            # marker size scales with hp_g (gene 1): roughly [60, 200]
+            sizes = (60.0 + 90.0 * np.clip(g_now[:, 1], 0.5, 2.0)).tolist()
+            # marker alpha by speed_g (gene 0): faster = more saturated
+            alphas = (0.45 + 0.45 * np.clip((g_now[:, 0] - 0.5) / 1.5, 0.0, 1.0)).tolist()
+            return sizes, alphas
+
         if pred_alive_now:
             xs = pos_t[pred_alive_now, 0]; ys = pos_t[pred_alive_now, 1]
-            ax_world.scatter(xs, ys, c="red", s=100, edgecolors="black", linewidths=0.6,
+            sizes, alphas = _sizes_and_alphas(pred_alive_now)
+            for x, y, s, a in zip(xs, ys, sizes, alphas):
+                ax_world.scatter([x], [y], c="red", s=s, alpha=a,
+                                  edgecolors="black", linewidths=0.6)
+            ax_world.scatter([], [], c="red", s=100, edgecolors="black", linewidths=0.6,
                               label=f"Predators ({n_pred_now})")
         if prey_alive_now:
             xs = pos_t[prey_alive_now, 0]; ys = pos_t[prey_alive_now, 1]
-            ax_world.scatter(xs, ys, c="green", s=100, edgecolors="black", linewidths=0.6,
+            sizes, alphas = _sizes_and_alphas(prey_alive_now)
+            for x, y, s, a in zip(xs, ys, sizes, alphas):
+                ax_world.scatter([x], [y], c="green", s=s, alpha=a,
+                                  edgecolors="black", linewidths=0.6)
+            ax_world.scatter([], [], c="green", s=100, edgecolors="black", linewidths=0.6,
                               label=f"Prey ({n_prey_now})")
         ax_world.legend(loc="upper right", fontsize=8)
         ax_world.set_xticks([]); ax_world.set_yticks([])
@@ -419,12 +449,14 @@ def make_video(
             elif mode == "ecosystem":
                 try:
                     positions, alive, agent_names = _load_pos_alive_names(f)
+                    genome = _load_genome(f)
                     _render_episode_ecosystem(
                         positions, alive, agent_names, writer,
                         pop_pred_global=pop_pred_global,
                         pop_prey_global=pop_prey_global,
                         cumulative_offset=ep_offsets[idx - 1] if ep_offsets else 0,
                         title_prefix=title, dpi=dpi, frameskip=frameskip, trail=trail,
+                        genome=genome,
                     )
                 except ValueError as e:
                     print(f"Skipping {f} for ecosystem replay: {e}")

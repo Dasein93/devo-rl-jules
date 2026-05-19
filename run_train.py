@@ -390,9 +390,17 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                         seq["states"].append(prey_state)
 
             if recorder and t % recorder.sample_rate == 0:
-                # Pass the per-step alive set so the recorder can populate
-                # the alive mask for the ecosystem replay.
-                recorder.record_step(t, obs, acts, rewards, done_any, infos)
+                # Per-agent genome capture for the ecosystem env. We pull the
+                # raw genome array off the env state for each alive agent —
+                # cheaper and more accurate than re-extracting from obs[-3:].
+                genome_by_agent = None
+                if env_id == "ecosystem" and hasattr(env, "_genome"):
+                    genome_by_agent = {
+                        a: env._genome[env._index(a)].copy()
+                        for a in obs.keys()
+                    }
+                recorder.record_step(t, obs, acts, rewards, done_any, infos,
+                                     genome_by_agent=genome_by_agent)
 
             obs = next_obs
             t += 1
