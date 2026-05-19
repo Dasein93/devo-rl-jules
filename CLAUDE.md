@@ -4,51 +4,123 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Predator–prey digital evolution + RL sandbox. PPO trained on PettingZoo MPE `simple_tag_v3` (parallel API), with shared-policy multi-agent training, trajectory recording, and MP4 replays.
+Predator–prey co-evolution sandbox on PettingZoo MPE `simple_tag_v3`:
+
+- **Per-team PPO** (`train/ppo.py`) — one policy per team, separate optimizers/replay.
+- **League of frozen snapshots** (`train/league.py`) — periodic snapshots of each
+  team's policy are sampled as opponents during rollouts to stabilise co-adaptation.
+- **GAE** with value-loss clipping and gradient clipping.
+- **Trajectory recording + replay** to MP4 (heatmap or 2D scatter).
 
 ## Commands
 
 ```bash
 pip install -r requirements.txt
 
-# Train (entrypoint is run_train.py; the notebook references run_cpu.py which does not exist).
-python run_train.py --config configs/base.yaml --episodes 50 --device cpu
-python run_train.py --config configs/base.yaml --episodes 200 --device cuda
+# Train (entrypoint is run_train.py).
+python run_train.py --config configs/base.yaml --episodes 200 --device cpu
+python run_train.py --config configs/base.yaml --episodes 1000 --device cuda
 
-# Resume: --resume_from points at an existing artifacts/run_* dir; it auto-loads the
-# newest checkpoints/*.pt by ctime and continues appending to metrics.csv.
-python run_train.py --config configs/base.yaml --episodes 100 --resume_from artifacts/run_YYYYMMDD_HHMM
+# Resume: --resume_from points at an existing artifacts/run_* dir; it auto-loads
+# the newest pred_*.pt and prey_*.pt by ctime and appends to metrics.csv.
+python run_train.py --config configs/base.yaml --episodes 2000 --resume_from artifacts/run_YYYYMMDD_HHMMSS
 
-# Tests
-pytest -q
-pytest tests/test_recorder.py::test_recorder_ragged_obs -v
+# Evaluate (deterministic by default). Glob is expanded; latest match wins.
+python tools/eval.py \
+  --pred 'artifacts/run_*/checkpoints/pred_*.pt' \
+  --prey 'artifacts/run_*/checkpoints/prey_*.pt' \
+  --episodes 20
+# Either side can be omitted to use a random-init baseline.
 
-# Replay an entire traj/ dir or a single .npz. The input is a POSITIONAL arg
-# (the README's `--in` example is wrong — argparse treats `in` as positional).
+# Tests — use `python -m pytest`, not `pytest`, because the system-wide `pytest`
+# is a separate uv-managed install that does not see the project requirements.
+python -m pytest -q
+python -m pytest tests/test_ppo.py::test_gae_terminal_zeros_bootstrap -v
+
+# Replay. `in` is a POSITIONAL argument; do NOT pass it as --in.
 python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode heatmap
-python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode positions
+python tools/replay.py artifacts/run_*/traj --out video.mp4 --mode positions --frameskip 2
 ```
 
-`tests/test_replay_positions.py` invokes `run_train.py` and `tools/replay.py` via `subprocess` against the real `configs/base.yaml`, so it requires ffmpeg and runs a short PettingZoo training — it's slow and the slowest part of the suite.
+`tests/test_replay_positions.py` invokes `run_train.py` and `tools/replay.py` via
+`subprocess` against the real `configs/base.yaml`, so it requires `ffmpeg` (from
+`imageio[ffmpeg]`) and is the slow test (~30 s). Skip with `-k 'not replay'` if iterating.
 
 ## Architecture
 
-Single shared policy across all agents. `run_train.py` is the orchestrator; `train/ppo.py` holds PPO + the recorder; `tools/replay.py` is an offline visualizer.
+**Per-team policies.** `run_train.py` uses `train.ppo.split_teams` to partition
+agents into predators (`"adversary" in name`) and prey, instantiates one PPO per
+team with potentially different `obs_dim`, and runs them in parallel. Per-step
+rewards are aggregated as the per-team mean and replicated across that team's
+agents before going into the buffer; only the team's own samples update its
+policy.
 
-**Observation handling.** Predators and prey have different observation sizes in `simple_tag_v3`. `flatten_obs()` in `train/ppo.py` sorts agent ids, ravels each obs vector, and right-pads them all to the max size so the shared MLP sees a uniform `(A, D)` matrix. The same padding happens again inside `TrajectoryRecorder._pad_and_stack` when saving. Anything that consumes raw obs must tolerate this padding.
+**League / "digital evolution".** `train/league.py` holds a FIFO pool of
+`ActorCritic` state dicts on disk under `league/{predator,prey}/snap_*.pt`. At
+each episode start, each league is asked for a sample: with probability
+`opponent_prob` it returns a randomly chosen frozen actor (eval mode, no grad).
+That team then plays the episode under the snapshot and its transitions are NOT
+collected — only the live policy of the other team is updated. Snapshots are
+pushed every `snapshot_every` episodes (cadence applies to the *episode index*,
+not the number of trained episodes). Eviction is oldest-first past
+`max_snapshots`.
 
-**Env step compatibility.** `_step()` in `run_train.py` handles both the 4-tuple (`obs, rew, done, info`) and 5-tuple (`obs, rew, term, trunc, info`) PettingZoo return shapes and collapses `done_any = any(...)` across agents. An episode ends when *any* agent terminates/truncates.
+**Env step compatibility.** `_step()` in `run_train.py` handles both the 4-tuple
+(`obs, rew, done, info`) and 5-tuple (`obs, rew, term, trunc, info`) PettingZoo
+return shapes and collapses `done_any = any(...)` across agents. An episode ends
+when *any* agent terminates/truncates.
 
-**PPO buffer layout (subtle).** The training loop appends `obs`/`acts`/`logps`/`vals` per-(step, agent) but `rews`/`dones` per-step (using `mean(rewards.values())`). Before `ppo.update()`, the per-step arrays are expanded by `rep = n_total // n_steps` to match the per-agent length. If you change how rewards are aggregated or how many entries get appended per step, fix this expansion too or the `assert` in `PPO.update` will fire.
+**PPO update API.** `PPO.update(obs, acts, logps, rews, dones, vals)` expects
+flat per-(timestep, agent) lists. `dones` is the per-step `done_any` flag
+replicated to match obs/acts length — needed so `_gae` correctly zeros the
+bootstrap at episode boundaries. If you change reward aggregation or
+per-step replication, audit both call sites in `run_train.py`'s `pred_buf` /
+`prey_buf` paths.
 
-**Trajectory recording.** Enabled via `recording.enabled: true` in the config. `TrajectoryRecorder` writes both `ep_<i>.jsonl` (full per-step records) and `ep_<i>.npz` (`obs`, `act`, `agent_names`, and `pos` when available) per episode, plus a single `manifest.json` at the end (env_cfg, seeds, agent_names, agent_roles). Saved `obs` is shape `(T*A, D)` flat while `act` is `(T, A)` — known asymmetry, tests rely on `obs.shape[0] % act.shape[0] == 0`.
+**GAE.** `PPO._gae` is a pure static function — easy to unit-test (see
+`tests/test_ppo.py`). It bootstraps with `V=0` past the buffer end, so the last
+timestep of each rollout effectively assumes terminal; combined with the
+per-step `done` mask this gives the standard GAE behaviour for episodic
+rollouts.
 
-**Position extraction is env-specific.** `record_step_positions` only runs when `"simple_tag" in env_id` and reads `obs[2:4]` — the agent's `(x, y)` slot in the simple_tag observation layout. Other envs need their own extraction.
+**Trajectory recording.** `TrajectoryRecorder` writes per-episode
+`ep_<i>.{jsonl,npz}` and a run-level `manifest.json`. NPZ layout is now
+`obs (T, A, D)`, `act (T, A)`, optional `pos (T, A, 2)`, plus `agent_names (A,)`
+— consistent across keys (previous flat `(T*A, D)` layout for `obs` was changed
+along with `tests/test_recorder.py`).
 
-**Roles by name.** Predator vs prey is inferred from agent id substring: `"adversary" in name` → predator, else prey. Used in both `manifest.json` and `tools/replay.py` (red predators, green prey). simple_tag agent ids follow this convention; new envs would need a different scheme.
+**Position extraction is env-specific.** `record_step` only emits `pos` when
+`"simple_tag" in env_id` and reads `obs[2:4]` — the agent's `(x, y)` slot in
+simple_tag's observation layout. Other envs would need their own extractor.
 
-**Artifacts layout.** Each run lives in `artifacts/run_<UTC timestamp>/` with `checkpoints/ckpt_<ep>.pt`, `plots/return.png`, `traj/ep_*.{npz,jsonl}` + `manifest.json`, and `metrics.csv`. `.gitignore` excludes `artifacts/`, `*.mp4`, `*.npz`, `*.csv` — keep generated files out of commits.
+**Roles by name.** Predator vs prey is inferred from agent id substring:
+`"adversary" in name` → predator, else prey. simple_tag agent ids follow this
+convention; new envs would need a different scheme (and `split_teams` would
+need to be generalised).
+
+**Artifacts layout.**
+
+```
+artifacts/run_<UTC timestamp>/
+├── checkpoints/{pred,prey}_<ep>.pt     # ActorCritic + Adam state, dims
+├── league/{predator,prey}/snap_*.pt    # frozen snapshots
+├── plots/return.png                    # per-team return curves
+├── traj/ep_*.{npz,jsonl} + manifest.json
+└── metrics.csv                         # ep, per-team returns/losses, league sizes
+```
+
+`.gitignore` excludes `artifacts/`, `*.mp4`, `*.npz`, `*.csv` — keep generated
+files out of commits.
 
 ## Config
 
-`configs/base.yaml` is the single source of truth for hyperparameters. CLI flags (`--episodes`, `--device`, `--save_dir`, `--resume_from`) override the corresponding config values; everything else (PPO coefficients, env shape, plot/checkpoint cadence, recording) only changes via the YAML.
+`configs/base.yaml` is the single source of truth for hyperparameters. CLI flags
+(`--episodes`, `--device`, `--save_dir`, `--resume_from`) override the
+corresponding config values; everything else (PPO coefficients, env shape,
+plot/checkpoint cadence, league, recording) only changes via the YAML.
+
+## CI
+
+`.github/workflows/ci.yml` runs `pytest -q` on push to `main` and on PRs against
+Python 3.11. The replay test is included, so the workflow requires
+`imageio[ffmpeg]` from `requirements.txt` (already present).
