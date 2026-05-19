@@ -23,13 +23,25 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple
 
 
+def _episode_index(path: str) -> int:
+    """Extract the integer N from a basename like 'ep_<N>.npz'. Falls back to 0."""
+    base = os.path.basename(path)
+    stem = os.path.splitext(base)[0]
+    if stem.startswith("ep_"):
+        try:
+            return int(stem[3:])
+        except ValueError:
+            pass
+    return 0
+
+
 def _find_trajectory_files(path: str) -> List[str]:
-    """Return a list of .npz files. If `path` is a file, return [path]."""
+    """Return a list of .npz files in chronological (episode-index) order.
+    If `path` is a file, return [path]."""
     if os.path.isfile(path):
         return [path]
-    # assume directory
-    files = sorted(glob.glob(os.path.join(path, "*.npz")))
-    return files
+    files = glob.glob(os.path.join(path, "*.npz"))
+    return sorted(files, key=lambda p: (_episode_index(p), p))
 
 
 def _load_obs(npz_path: str) -> np.ndarray:
