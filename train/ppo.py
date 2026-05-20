@@ -68,6 +68,65 @@ class ActorCritic(nn.Module):
         return a, logp, v
 
 
+class RecurrentActorCritic(nn.Module):
+    """GRU-trunk actor-critic. Both heads consume the GRU's output.
+
+    Hidden state shape: (1, B, hidden) — one GRU layer, B agents in a batch.
+    Use `forward_step` during rollout (one timestep at a time, returning the
+    updated hidden) and `forward_seq` during the PPO update (full per-agent
+    sequence with BPTT through the GRU)."""
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden = hidden
+        self.state_dim = obs_dim   # for save/load shape parity with ActorCritic
+        self.gru = nn.GRU(obs_dim, hidden, num_layers=1, batch_first=True)
+        self.actor = nn.Linear(hidden, act_dim)
+        self.critic = nn.Linear(hidden, 1)
+
+    def init_hidden(self, batch_size: int, device: str = "cpu") -> torch.Tensor:
+        return torch.zeros(1, batch_size, self.hidden, device=device)
+
+    def forward_step(self, obs: torch.Tensor, h: torch.Tensor):
+        """One step. obs (B, obs_dim), h (1, B, hidden).
+        Returns logits (B, act_dim), v (B), h_new (1, B, hidden)."""
+        x = obs.unsqueeze(1)  # (B, 1, obs_dim)
+        out, h_new = self.gru(x, h)
+        feat = out.squeeze(1)  # (B, hidden)
+        return self.actor(feat), self.critic(feat).squeeze(-1), h_new
+
+    def forward_seq(self, obs_seq: torch.Tensor, h_init: torch.Tensor):
+        """T steps. obs_seq (B, T, obs_dim), h_init (1, B, hidden).
+        Returns logits (B, T, act_dim), v (B, T), h_final."""
+        out, h_final = self.gru(obs_seq, h_init)
+        return self.actor(out), self.critic(out).squeeze(-1), h_final
+
+    def step(self, obs: torch.Tensor, h: Optional[torch.Tensor] = None,
+             deterministic: bool = False):
+        """Wraps forward_step + sampling, matching ActorCritic.step's interface
+        but with an extra hidden-state argument."""
+        if h is None:
+            h = self.init_hidden(obs.shape[0], obs.device)
+        logits, v, h_new = self.forward_step(obs, h)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = logits.argmax(-1) if deterministic else dist.sample()
+        logp = dist.log_prob(a)
+        return a, logp, v, h_new
+
+    def act(self, obs: torch.Tensor, h: Optional[torch.Tensor] = None,
+            deterministic: bool = False):
+        """Actor-only path for opponent rollouts. Returns (a, logp, h_new)."""
+        if h is None:
+            h = self.init_hidden(obs.shape[0], obs.device)
+        logits, _v, h_new = self.forward_step(obs, h)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = logits.argmax(-1) if deterministic else dist.sample()
+        logp = dist.log_prob(a)
+        return a, logp, h_new
+
+
 @dataclass
 class PPOConfig:
     lr: float = 3e-4
@@ -88,16 +147,27 @@ class PPO:
 
     Pass `state_dim` to enable a centralised critic (MAPPO). Then the caller
     must supply `states` to `update()` and pre-computed `vals` from
-    `ActorCritic.value(state)` rather than from observations."""
+    `ActorCritic.value(state)` rather than from observations.
+
+    Pass `recurrent=True` to use a GRU-based ActorCritic. With recurrent on,
+    state_dim is ignored (centralised critic + recurrent isn't supported in
+    this iteration) and the caller must hand per-agent (obs_seq, h_init)
+    pairs to update_recurrent rather than flat rows."""
 
     def __init__(self, obs_dim: int, act_dim: int, cfg: PPOConfig, device: str = "cpu",
-                 state_dim: Optional[int] = None):
+                 state_dim: Optional[int] = None, recurrent: bool = False):
         self.cfg = cfg
         self.device = device
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.recurrent = bool(recurrent)
         self.state_dim = int(state_dim) if state_dim else obs_dim
-        self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden, state_dim=self.state_dim).to(device)
+        if self.recurrent:
+            if state_dim is not None and int(state_dim) != obs_dim:
+                raise ValueError("recurrent=True is not compatible with a separate state_dim")
+            self.ac: nn.Module = RecurrentActorCritic(obs_dim, act_dim, cfg.hidden).to(device)
+        else:
+            self.ac = ActorCritic(obs_dim, act_dim, cfg.hidden, state_dim=self.state_dim).to(device)
         self.opt = optim.Adam(self.ac.parameters(), lr=cfg.lr)
 
     def save(self, path: str, episode: int, returns: list, extra: Optional[dict] = None):
@@ -111,6 +181,7 @@ class PPO:
             "act_dim": self.act_dim,
             "state_dim": self.state_dim,
             "hidden": self.cfg.hidden,
+            "recurrent": self.recurrent,
         }
         if extra:
             payload.update(extra)
@@ -214,6 +285,85 @@ class PPO:
             "v_loss": v_acc / max(1, n_batches),
             "entropy": ent_acc / max(1, n_batches),
             "samples": n,
+        }
+
+    def update_recurrent(self, sequences: list) -> Dict[str, float]:
+        """Recurrent PPO update.
+
+        `sequences` is a list of per-agent rollout dicts:
+            {"obs":  np.ndarray (T, obs_dim),
+             "acts": list[int]  (T,),
+             "logps": list[float] (T,),
+             "vals":  list[float] (T,),
+             "advs":  list[float] (T,),
+             "rets":  list[float] (T,)}
+
+        Each sequence is processed independently (no minibatching across
+        sequences, since they would need padding and masking). Full BPTT
+        through the GRU per sequence. Multiple update epochs are taken
+        over the same set of sequences.
+        """
+        if not self.recurrent:
+            raise RuntimeError("update_recurrent called on a non-recurrent PPO")
+        if not sequences:
+            return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+        cfg = self.cfg
+
+        # Normalise advantages across the union of sequences (matches non-rec path).
+        all_advs = np.concatenate([np.asarray(s["advs"], dtype=np.float32) for s in sequences])
+        adv_mean = float(all_advs.mean())
+        adv_std = float(all_advs.std()) + 1e-8
+
+        pg_acc = v_acc = ent_acc = 0.0
+        n_updates = 0
+        total_samples = sum(s["obs"].shape[0] for s in sequences)
+
+        for _ in range(cfg.update_epochs):
+            order = np.random.permutation(len(sequences))
+            for idx in order:
+                s = sequences[idx]
+                T = s["obs"].shape[0]
+                if T == 0:
+                    continue
+                obs_t = torch.as_tensor(s["obs"], dtype=torch.float32, device=self.device).unsqueeze(0)        # (1, T, obs_dim)
+                acts_t = torch.as_tensor(np.asarray(s["acts"]), dtype=torch.int64, device=self.device)
+                ol = torch.as_tensor(np.asarray(s["logps"], dtype=np.float32), device=self.device)
+                ov = torch.as_tensor(np.asarray(s["vals"], dtype=np.float32), device=self.device)
+                advs_t = torch.as_tensor(np.asarray(s["advs"], dtype=np.float32), device=self.device)
+                rets_t = torch.as_tensor(np.asarray(s["rets"], dtype=np.float32), device=self.device)
+                advs_t = (advs_t - adv_mean) / adv_std
+
+                h0 = self.ac.init_hidden(1, self.device)
+                logits_seq, v_seq, _ = self.ac.forward_seq(obs_t, h0)  # (1, T, A), (1, T)
+                logits = logits_seq.squeeze(0)
+                v = v_seq.squeeze(0)
+
+                dist = torch.distributions.Categorical(logits=logits)
+                logp = dist.log_prob(acts_t)
+                ratio = (logp - ol).exp()
+                clip_adv = torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef) * advs_t
+                pg_loss = -(torch.min(ratio * advs_t, clip_adv)).mean()
+
+                v_clip = ov + (v - ov).clamp(-cfg.clip_coef, cfg.clip_coef)
+                v_loss = 0.5 * torch.max((v - rets_t).pow(2), (v_clip - rets_t).pow(2)).mean()
+
+                ent = dist.entropy().mean()
+                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
+                self.opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.ac.parameters(), cfg.max_grad_norm)
+                self.opt.step()
+
+                pg_acc += pg_loss.item()
+                v_acc += v_loss.item()
+                ent_acc += ent.item()
+                n_updates += 1
+
+        return {
+            "pg_loss": pg_acc / max(1, n_updates),
+            "v_loss": v_acc / max(1, n_updates),
+            "entropy": ent_acc / max(1, n_updates),
+            "samples": total_samples,
         }
 
 

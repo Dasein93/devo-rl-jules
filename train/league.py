@@ -13,7 +13,7 @@ from typing import Optional, List
 import numpy as np
 import torch
 
-from train.ppo import ActorCritic
+from train.ppo import ActorCritic, RecurrentActorCritic
 
 
 class League:
@@ -42,7 +42,7 @@ class League:
             return None
         return self.snapshot(ac, episode)
 
-    def snapshot(self, ac: ActorCritic, episode: int) -> str:
+    def snapshot(self, ac, episode: int) -> str:
         path = os.path.join(self.save_dir, f"snap_{episode:06d}.pt")
         payload = {
             "ac_state_dict": ac.state_dict(),
@@ -50,6 +50,7 @@ class League:
             "act_dim": ac.act_dim,
             "hidden": ac.hidden,
             "state_dim": ac.state_dim,
+            "recurrent": isinstance(ac, RecurrentActorCritic),
             "episode": episode,
         }
         torch.save(payload, path)
@@ -75,14 +76,21 @@ class League:
         path = self._cached[self.rng.integers(0, len(self._cached))]
         return self._load(path)
 
-    def _load(self, path: str) -> ActorCritic:
+    def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        ac = ActorCritic(
-            obs_dim=ckpt["obs_dim"],
-            act_dim=ckpt["act_dim"],
-            hidden=ckpt["hidden"],
-            state_dim=ckpt.get("state_dim"),
-        ).to(self.device)
+        if ckpt.get("recurrent", False):
+            ac = RecurrentActorCritic(
+                obs_dim=ckpt["obs_dim"],
+                act_dim=ckpt["act_dim"],
+                hidden=ckpt["hidden"],
+            ).to(self.device)
+        else:
+            ac = ActorCritic(
+                obs_dim=ckpt["obs_dim"],
+                act_dim=ckpt["act_dim"],
+                hidden=ckpt["hidden"],
+                state_dim=ckpt.get("state_dim"),
+            ).to(self.device)
         ac.load_state_dict(ckpt["ac_state_dict"])
         ac.eval()
         for p in ac.parameters():

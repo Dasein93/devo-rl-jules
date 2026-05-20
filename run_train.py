@@ -128,6 +128,33 @@ def _act_team_actor_only(ac: ActorCritic, obs_arr: np.ndarray, device: str,
     return a.cpu().numpy(), logp.cpu().numpy()
 
 
+def _act_team_recurrent(ac, obs_arr: np.ndarray, h_stack: torch.Tensor, device: str,
+                         deterministic: bool = False):
+    """Recurrent variant of _act_team. Returns (acts, logps, vals, h_new) where
+    h_stack is the stacked per-agent hidden (1, B, hidden) and h_new is the
+    updated hidden after this step."""
+    n = obs_arr.shape[0]
+    if n == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, np.array([], dtype=np.float32), np.array([], dtype=np.float32), h_stack
+    with torch.no_grad():
+        o = torch.from_numpy(obs_arr).to(device)
+        a, logp, v, h_new = ac.step(o, h_stack, deterministic=deterministic)
+    return a.cpu().numpy(), logp.cpu().numpy(), v.cpu().numpy(), h_new
+
+
+def _act_team_actor_only_recurrent(ac, obs_arr: np.ndarray, h_stack: torch.Tensor,
+                                    device: str, deterministic: bool = False):
+    """For recurrent league opponents — returns (acts, logps, h_new) without v."""
+    n = obs_arr.shape[0]
+    if n == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32), h_stack
+    with torch.no_grad():
+        o = torch.from_numpy(obs_arr).to(device)
+        a, logp, h_new = ac.act(o, h_stack, deterministic=deterministic)
+    return a.cpu().numpy(), logp.cpu().numpy(), h_new
+
+
 def _plot_returns(plots_dir: str, pred_ret: List[float], prey_ret: List[float], window: int):
     if not pred_ret and not prey_ret:
         return
@@ -227,12 +254,19 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         max_grad_norm=float(tcfg.get("max_grad_norm", 0.5)),
     )
     centralized = bool(tcfg.get("centralized_critic", False))
+    recurrent = bool(tcfg.get("recurrent", False))
+    if recurrent and centralized:
+        raise ValueError("train.recurrent and train.centralized_critic are not currently compatible")
     pred_state_dim = pred_obs_dim * len(pred_agents) if centralized else None
     prey_state_dim = prey_obs_dim * len(prey_agents) if centralized else None
-    ppo_pred = PPO(pred_obs_dim, act_dim, ppo_cfg, device=device, state_dim=pred_state_dim)
-    ppo_prey = PPO(prey_obs_dim, act_dim, ppo_cfg, device=device, state_dim=prey_state_dim)
+    ppo_pred = PPO(pred_obs_dim, act_dim, ppo_cfg, device=device,
+                   state_dim=pred_state_dim, recurrent=recurrent)
+    ppo_prey = PPO(prey_obs_dim, act_dim, ppo_cfg, device=device,
+                   state_dim=prey_state_dim, recurrent=recurrent)
     if centralized:
         print(f"Centralised critic enabled: pred_state_dim={pred_state_dim}, prey_state_dim={prey_state_dim}")
+    if recurrent:
+        print(f"Recurrent (GRU) policies enabled: hidden={ppo_cfg.hidden}")
 
     lcfg = cfg.get("league", {})
     league_enabled = bool(lcfg.get("enabled", True))
@@ -318,6 +352,15 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         pop_pred_series: List[int] = []
         pop_prey_series: List[int] = []
 
+        # Per-agent hidden state for recurrent policies (h init to zeros at
+        # episode start / agent birth). Stored unstacked so we can scatter into
+        # the right slot as agents are born and die mid-episode.
+        pred_h: Dict[str, torch.Tensor] = {}
+        prey_h: Dict[str, torch.Tensor] = {}
+
+        def _h_init(ppo_):
+            return ppo_.ac.init_hidden(1, device=device)
+
         while not done_any:
             # Filter the initial roster down to whoever is still in the obs dict.
             # In simple_tag this equals the full roster every step; in ecosystem
@@ -339,16 +382,43 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
 
             # Trained team: full step (actor + critic). Opponent (league snapshot):
             # actor only, since its critic shape may not match our centralised state.
-            if train_pred:
-                pa, plogp, pv = _act_team(pred_actor, pred_obs_stack, device, state=pred_state)
+            if recurrent:
+                # Ensure each alive agent has a hidden tensor; init newcomers to zeros.
+                for a in pred_alive:
+                    if a not in pred_h:
+                        pred_h[a] = _h_init(ppo_pred)
+                for a in prey_alive:
+                    if a not in prey_h:
+                        prey_h[a] = _h_init(ppo_prey)
+                pred_h_stack = torch.cat([pred_h[a] for a in pred_alive], dim=1)
+                prey_h_stack = torch.cat([prey_h[a] for a in prey_alive], dim=1)
+
+                if train_pred:
+                    pa, plogp, pv, pred_h_new = _act_team_recurrent(pred_actor, pred_obs_stack, pred_h_stack, device)
+                else:
+                    pa, plogp, pred_h_new = _act_team_actor_only_recurrent(pred_actor, pred_obs_stack, pred_h_stack, device)
+                    pv = np.zeros(len(pred_alive), dtype=np.float32)
+                if train_prey:
+                    ya, ylogp, yv, prey_h_new = _act_team_recurrent(prey_actor, prey_obs_stack, prey_h_stack, device)
+                else:
+                    ya, ylogp, prey_h_new = _act_team_actor_only_recurrent(prey_actor, prey_obs_stack, prey_h_stack, device)
+                    yv = np.zeros(len(prey_alive), dtype=np.float32)
+                # Scatter updated hidden states back into the per-agent dicts.
+                for i, a in enumerate(pred_alive):
+                    pred_h[a] = pred_h_new[:, i:i + 1, :].detach()
+                for i, a in enumerate(prey_alive):
+                    prey_h[a] = prey_h_new[:, i:i + 1, :].detach()
             else:
-                pa, plogp = _act_team_actor_only(pred_actor, pred_obs_stack, device)
-                pv = np.zeros(len(pred_alive), dtype=np.float32)
-            if train_prey:
-                ya, ylogp, yv = _act_team(prey_actor, prey_obs_stack, device, state=prey_state)
-            else:
-                ya, ylogp = _act_team_actor_only(prey_actor, prey_obs_stack, device)
-                yv = np.zeros(len(prey_alive), dtype=np.float32)
+                if train_pred:
+                    pa, plogp, pv = _act_team(pred_actor, pred_obs_stack, device, state=pred_state)
+                else:
+                    pa, plogp = _act_team_actor_only(pred_actor, pred_obs_stack, device)
+                    pv = np.zeros(len(pred_alive), dtype=np.float32)
+                if train_prey:
+                    ya, ylogp, yv = _act_team(prey_actor, prey_obs_stack, device, state=prey_state)
+                else:
+                    ya, ylogp = _act_team_actor_only(prey_actor, prey_obs_stack, device)
+                    yv = np.zeros(len(prey_alive), dtype=np.float32)
 
             acts = {}
             for i, a in enumerate(pred_alive): acts[a] = int(pa[i])
@@ -418,9 +488,29 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         def _update_per_agent(ppo_, per_agent_buf, train_flag):
             if not train_flag:
                 return {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "samples": 0}
+            cfg_g = ppo_.cfg
+
+            # Recurrent path: hand per-agent sequences (with GAE'd adv/rets) directly
+            # to update_recurrent so BPTT works on each independent trajectory.
+            if ppo_.recurrent:
+                sequences = []
+                for _agent, seq in per_agent_buf.items():
+                    if not seq["obs"]:
+                        continue
+                    adv, rets = PPO._gae(seq["rews"], seq["dones"], seq["vals"],
+                                         cfg_g.gamma, cfg_g.gae_lambda)
+                    sequences.append({
+                        "obs": np.asarray(seq["obs"], dtype=np.float32),
+                        "acts": seq["acts"],
+                        "logps": seq["logps"],
+                        "vals": seq["vals"],
+                        "advs": adv.tolist(),
+                        "rets": rets.tolist(),
+                    })
+                return ppo_.update_recurrent(sequences)
+
             all_obs, all_acts, all_logps, all_vals = [], [], [], []
             all_advs, all_rets, all_states = [], [], []
-            cfg_g = ppo_.cfg
             for _agent, seq in per_agent_buf.items():
                 if not seq["obs"]:
                     continue
