@@ -1,0 +1,93 @@
+seed: 42
+device: cpu
+
+env:
+  id: ecosystem
+  max_steps: 1500
+  # Starting populations larger; room to grow up to max_predators / max_prey.
+  n_predators: 20
+  n_prey: 20
+  ecosystem:
+    # World is 3x larger by linear dimension (9x larger by area).
+    world_size: 6.0
+    boundary_threshold: 2.7        # soft penalty starts at 0.9 * (world_size/2)
+    max_predators: 60
+    max_prey: 60
+    # Combat / sensing scale up with the world so agents still encounter each other.
+    pred_max_hp: 100.0
+    pred_max_energy: 80.0
+    pred_speed: 0.12
+    pred_sense_radius: 1.2
+    prey_max_hp: 30.0
+    prey_max_energy: 100.0
+    prey_speed: 0.16
+    prey_sense_radius: 1.2
+    attack_damage: 15.0
+    attack_range: 0.12
+    eat_energy_gain: 30.0
+    pred_energy_cost: 1.0
+    prey_energy_cost: 0.3
+    # Food field — denser grid for the larger world.
+    food_grid_size: 32
+    food_cell_max: 8.0
+    food_regen_rate: 0.06
+    food_eat_rate: 5.0
+    # Reproduction
+    repro_pred_energy_thresh: 55.0
+    repro_prey_energy_thresh: 50.0
+    repro_min_age: 20
+    repro_cooldown: 15
+    repro_child_hp_frac: 1.0
+    repro_child_energy_frac: 0.5
+    repro_parent_energy_keep: 0.5
+    # Rewards
+    reward_per_hit: 10.0
+    reward_per_death: -50.0
+    reward_per_birth: 5.0
+    survival_bonus: 0.05
+    boundary_penalty: 5.0
+    max_neighbors_obs: 6           # bigger team means more useful neighbour slots
+    # Obstacles — circular barriers that block movement AND line-of-sight.
+    obstacles_count: 12
+    obstacles_radius_min: 0.20
+    obstacles_radius_max: 0.45
+    obstacles_in_obs: 4            # nearest K obstacles included in each agent's obs
+    # Genome
+    genome_enabled: true
+    genome_init_sigma: 0.08
+    mutation_sigma: 0.05
+    genome_min: 0.5
+    genome_max: 2.0
+
+train:
+  algo: ppo
+  total_episodes: 300
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  minibatch_size: 1024
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128
+  centralized_critic: false
+
+league:
+  enabled: true
+  snapshot_every: 25
+  opponent_prob: 0.15
+  max_snapshots: 20
+
+logging:
+  save_dir: artifacts/
+  plot_every: 25
+
+checkpoint:
+  enabled: true
+  every: 100
+
+recording:
+  enabled: true
+  sample_rate: 1
