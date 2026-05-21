@@ -291,6 +291,11 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
     for ep in range(start_ep, total_episodes + 1):
         obs = _reset(env, seed=seed + ep)
 
+        # Snap the per-episode obstacle layout for the recorder so the replay
+        # can draw the same circles agents were navigating around.
+        if recorder and hasattr(env, "_n_obstacles") and getattr(env, "_n_obstacles", 0) > 0:
+            recorder.record_obstacles(env._obs_centers, env._obs_radii)
+
         opp_pred = league_pred.sample()
         opp_prey = league_prey.sample()
         pred_actor = opp_pred if opp_pred is not None else ppo_pred.ac
@@ -401,6 +406,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                     }
                 recorder.record_step(t, obs, acts, rewards, done_any, infos,
                                      genome_by_agent=genome_by_agent)
+                if env_id == "ecosystem" and hasattr(env, "_food"):
+                    recorder.record_food(env._food)
 
             obs = next_obs
             t += 1

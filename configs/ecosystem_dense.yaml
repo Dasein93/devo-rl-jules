@@ -1,0 +1,93 @@
+seed: 42
+device: cpu
+
+env:
+  id: ecosystem
+  max_steps: 1000
+  # Higher starting population in a smaller-but-still-large world for usable density.
+  n_predators: 25
+  n_prey: 25
+  ecosystem:
+    # 4x4 world (4x default area), denser than ecosystem_big.yaml.
+    world_size: 4.0
+    boundary_threshold: 1.8        # 0.9 * (world_size/2)
+    max_predators: 60
+    max_prey: 60
+    # Combat / sensing — sense radius proportional to world size.
+    pred_max_hp: 100.0
+    pred_max_energy: 80.0
+    pred_speed: 0.08
+    pred_sense_radius: 0.9
+    prey_max_hp: 30.0
+    prey_max_energy: 100.0
+    prey_speed: 0.10
+    prey_sense_radius: 0.9
+    attack_damage: 15.0
+    attack_range: 0.10
+    eat_energy_gain: 30.0
+    pred_energy_cost: 0.8
+    prey_energy_cost: 0.3
+    # Food
+    food_grid_size: 24
+    food_cell_max: 8.0
+    food_regen_rate: 0.06
+    food_eat_rate: 5.0
+    # Reproduction
+    repro_pred_energy_thresh: 55.0
+    repro_prey_energy_thresh: 50.0
+    repro_min_age: 20
+    repro_cooldown: 15
+    repro_child_hp_frac: 1.0
+    repro_child_energy_frac: 0.5
+    repro_parent_energy_keep: 0.5
+    # Rewards
+    reward_per_hit: 10.0
+    reward_per_death: -50.0
+    reward_per_birth: 5.0
+    survival_bonus: 0.05
+    boundary_penalty: 5.0
+    max_neighbors_obs: 6
+    # Obstacles — fewer than ecosystem_big.yaml so predators aren't fenced out.
+    obstacles_count: 6
+    obstacles_radius_min: 0.15
+    obstacles_radius_max: 0.30
+    obstacles_in_obs: 4
+    # Genome
+    genome_enabled: true
+    genome_init_sigma: 0.08
+    mutation_sigma: 0.05
+    genome_min: 0.5
+    genome_max: 2.0
+
+train:
+  algo: ppo
+  total_episodes: 400
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  minibatch_size: 1024
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128
+  centralized_critic: false
+
+league:
+  enabled: true
+  snapshot_every: 25
+  opponent_prob: 0.15
+  max_snapshots: 20
+
+logging:
+  save_dir: artifacts/
+  plot_every: 25
+
+checkpoint:
+  enabled: true
+  every: 100
+
+recording:
+  enabled: true
+  sample_rate: 1

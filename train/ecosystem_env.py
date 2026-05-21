@@ -73,9 +73,20 @@ class EcosystemConfig:
     reward_per_birth: float = 5.0     # given to the parent when a child is spawned
     survival_bonus: float = 0.05      # per step alive
 
-    # Boundary (soft penalty when outside [-0.9, 0.9])
-    boundary_threshold: float = 0.9
-    boundary_penalty: float = 5.0     # multiplied by overshoot^2
+    # Boundary (soft penalty when outside boundary_threshold * world_half_size)
+    boundary_threshold_frac: float = 0.9   # fraction of world half-size
+    boundary_threshold: float = 0.9        # legacy; treated as multiplier when >0
+    boundary_penalty: float = 5.0          # multiplied by overshoot^2
+
+    # Obstacles: circular barriers placed at reset. They block movement
+    # (agents are pushed to the obstacle perimeter on collision) and break
+    # line-of-sight (an agent at A cannot see another at B if the segment AB
+    # crosses any obstacle disc). Each agent's obs includes the K nearest
+    # obstacles as (relative_x, relative_y, radius).
+    obstacles_count: int = 0
+    obstacles_radius_min: float = 0.10
+    obstacles_radius_max: float = 0.20
+    obstacles_in_obs: int = 4              # K nearest obstacles included in each agent's obs
 
     # Genome (Phase 3). Per-agent multipliers on (speed, hp_cap, sense_radius).
     # Children inherit parent's genome plus Gaussian noise (mutation_sigma).
@@ -166,9 +177,15 @@ class EcosystemEnv:
         G = self.cfg.food_grid_size
         self._food = np.full((G, G), self.cfg.food_cell_max, dtype=np.float32)
 
+        # Obstacles — re-populated each reset(). (M, 2) centres + (M,) radii.
+        self._n_obstacles = int(self.cfg.obstacles_count)
+        self._obs_centers = np.zeros((self._n_obstacles, 2), dtype=np.float32)
+        self._obs_radii = np.zeros(self._n_obstacles, dtype=np.float32)
+
         # Obs: own (6) + K nearest neighbours (6 each) + own-cell food (1)
-        # + own genome (3).
-        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs + 1 + 3
+        # + own genome (3) + M nearest obstacles (3 each: rel_x, rel_y, radius).
+        self._k_obs_obstacles = min(self.cfg.obstacles_in_obs, self._n_obstacles) if self._n_obstacles > 0 else 0
+        self._obs_dim = 6 + 6 * self.cfg.max_neighbors_obs + 1 + 3 + 3 * self._k_obs_obstacles
         self._obs_space = _Box(-np.inf, np.inf, (self._obs_dim,), np.float32)
         self._act_space = _Discrete(5)
 
@@ -226,6 +243,32 @@ class EcosystemEnv:
 
         # Refill food grid.
         self._food[:] = self.cfg.food_cell_max
+        # Place obstacles. We sample positions away from world edges so they
+        # don't fence agents into corners, and reject placements that overlap
+        # an existing obstacle. Any starting agent caught inside an obstacle
+        # gets pushed to its perimeter.
+        if self._n_obstacles > 0:
+            half = self.cfg.world_size / 2.0
+            margin = max(self.cfg.obstacles_radius_max + 0.05, 0.1)
+            self._obs_radii[:] = self._rng.uniform(
+                self.cfg.obstacles_radius_min, self.cfg.obstacles_radius_max,
+                size=self._n_obstacles,
+            ).astype(np.float32)
+            placed = 0
+            for _try in range(self._n_obstacles * 40):
+                cand = self._rng.uniform(-half + margin, half - margin, size=2).astype(np.float32)
+                ok = True
+                for j in range(placed):
+                    if float(np.linalg.norm(cand - self._obs_centers[j])) < float(self._obs_radii[j] + self._obs_radii[placed] + 0.05):
+                        ok = False; break
+                if ok:
+                    self._obs_centers[placed] = cand
+                    placed += 1
+                    if placed >= self._n_obstacles:
+                        break
+            # Push any starting agent out of an obstacle.
+            for i in np.where(self._alive)[0]:
+                self._pos[i] = self._resolve_obstacle_collision(self._pos[i])
         self._t = 0
         obs = self._build_obs_dict()
         infos = {a: {} for a in obs}
@@ -246,6 +289,8 @@ class EcosystemEnv:
             self._vel[i] = _ACTION_VEC[int(action) % 5] * speed
             self._pos[i] += self._vel[i]
             self._pos[i] = np.clip(self._pos[i], -half, half)
+            if self._n_obstacles > 0:
+                self._pos[i] = self._resolve_obstacle_collision(self._pos[i])
 
         # 2. Resolve predator-prey collisions.
         rewards = {name: 0.0 for name in self.agents}
@@ -367,6 +412,53 @@ class EcosystemEnv:
         base = self.cfg.pred_sense_radius if self._is_pred[i] else self.cfg.prey_sense_radius
         return base * float(self._genome[i, 2])
 
+    def _resolve_obstacle_collision(self, pos: np.ndarray) -> np.ndarray:
+        """Push `pos` to the perimeter of any obstacle it has entered.
+        Iterates a few times in case displacement pushes into a neighbour."""
+        if self._n_obstacles == 0:
+            return pos
+        out = pos.astype(np.float32, copy=True)
+        for _ in range(3):
+            moved = False
+            for j in range(self._n_obstacles):
+                delta = out - self._obs_centers[j]
+                d = float(np.linalg.norm(delta))
+                r = float(self._obs_radii[j])
+                if d < r:
+                    if d > 1e-6:
+                        out = self._obs_centers[j] + (delta * (r / d)).astype(np.float32)
+                    else:
+                        # Degenerate: agent exactly at obstacle centre. Push +x.
+                        out = self._obs_centers[j] + np.array([r, 0.0], dtype=np.float32)
+                    moved = True
+            if not moved:
+                break
+        return out
+
+    def _segment_intersects_obstacle(self, p: np.ndarray, q: np.ndarray) -> bool:
+        """Whether the line segment p→q crosses any obstacle disc.
+        Used by `_build_obs_dict` to break sight lines through obstacles."""
+        if self._n_obstacles == 0:
+            return False
+        d = q - p
+        a = float(d.dot(d))
+        if a < 1e-12:
+            return False
+        for j in range(self._n_obstacles):
+            f = p - self._obs_centers[j]
+            b = 2.0 * float(f.dot(d))
+            r = float(self._obs_radii[j])
+            c_term = float(f.dot(f)) - r * r
+            disc = b * b - 4.0 * a * c_term
+            if disc < 0.0:
+                continue
+            disc_sqrt = math.sqrt(disc)
+            t1 = (-b - disc_sqrt) / (2.0 * a)
+            t2 = (-b + disc_sqrt) / (2.0 * a)
+            if (0.0 <= t1 <= 1.0) or (0.0 <= t2 <= 1.0):
+                return True
+        return False
+
     def _world_to_grid(self, pos: np.ndarray) -> Tuple[int, int]:
         """Map a 2D world coordinate to (row, col) in the food grid."""
         G = self.cfg.food_grid_size
@@ -479,7 +571,13 @@ class EcosystemEnv:
             if others:
                 deltas = self._pos[others] - self._pos[i]
                 dists = np.linalg.norm(deltas, axis=1)
-                visible = [(d, j, k) for k, (d, j) in enumerate(zip(dists, others)) if d <= sense_r]
+                visible = []
+                for k, (d, j) in enumerate(zip(dists, others)):
+                    if d > sense_r:
+                        continue
+                    if self._n_obstacles > 0 and self._segment_intersects_obstacle(self._pos[i], self._pos[j]):
+                        continue
+                    visible.append((d, j, k))
                 visible.sort(key=lambda x: x[0])
                 for slot, (_d, j, k) in enumerate(visible[: cfg.max_neighbors_obs]):
                     off = 6 + 6 * slot
@@ -490,10 +588,23 @@ class EcosystemEnv:
                     obs[off + 4] = 1.0 if self._is_pred[j] else 0.0
                     obs[off + 5] = 0.0 if self._is_pred[j] else 1.0
 
-            # Own-cell food scalar + own genome (last 1+3 dims).
+            # Own-cell food scalar + own genome.
             gx, gy = self._world_to_grid(self._pos[i])
-            obs[-4] = float(self._food[gx, gy]) / max(1e-6, cfg.food_cell_max)
-            obs[-3:] = self._genome[i]
+            food_off = 6 + 6 * cfg.max_neighbors_obs
+            obs[food_off] = float(self._food[gx, gy]) / max(1e-6, cfg.food_cell_max)
+            obs[food_off + 1 : food_off + 4] = self._genome[i]
+
+            # Nearest K obstacles (rel_x, rel_y, radius).
+            if self._k_obs_obstacles > 0:
+                ob_deltas = self._obs_centers - self._pos[i]
+                ob_dists = np.linalg.norm(ob_deltas, axis=1)
+                order = np.argsort(ob_dists)[: self._k_obs_obstacles]
+                base = food_off + 4
+                for slot, j in enumerate(order):
+                    off = base + 3 * slot
+                    obs[off + 0] = ob_deltas[j, 0]
+                    obs[off + 1] = ob_deltas[j, 1]
+                    obs[off + 2] = float(self._obs_radii[j])
 
             out[self._all_names[i]] = obs
         return out

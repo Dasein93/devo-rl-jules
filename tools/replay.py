@@ -118,6 +118,23 @@ def _load_genome(npz_path: str) -> Optional[np.ndarray]:
         return np.asarray(data["genome"], dtype=np.float32)
 
 
+def _load_obstacles(npz_path: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Load (centers (M,2), radii (M,)) obstacle layout if present, else None."""
+    with np.load(npz_path, allow_pickle=True) as data:
+        if "obstacles_centers" not in data or "obstacles_radii" not in data:
+            return None
+        return (np.asarray(data["obstacles_centers"], dtype=np.float32),
+                np.asarray(data["obstacles_radii"], dtype=np.float32))
+
+
+def _load_food(npz_path: str) -> Optional[np.ndarray]:
+    """Load per-step food grid (T, G, G) if present, else None."""
+    with np.load(npz_path, allow_pickle=True) as data:
+        if "food" not in data:
+            return None
+        return np.asarray(data["food"], dtype=np.float32)
+
+
 def _normalize_for_visual(obs_t: np.ndarray) -> np.ndarray:
     """
     Normalize a single time-step obs (A, D) to [0,1] per-feature-window for heatmap.
@@ -258,6 +275,8 @@ def _render_episode_ecosystem(
     frameskip: int = 1,
     trail: int = 0,
     genome: Optional[np.ndarray] = None,
+    obstacles: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    food: Optional[np.ndarray] = None,
 ) -> None:
     """Render one ecosystem episode as a split panel.
 
@@ -296,6 +315,25 @@ def _render_episode_ecosystem(
         ax_world.set_ylim(world_bounds)
         ax_world.set_aspect("equal")
         ax_world.set_title(f"{title_prefix}t={t}", fontsize=10)
+
+        # Draw the food field as a faint green heatmap underneath everything.
+        if food is not None and t < food.shape[0]:
+            half = max(abs(world_bounds[0]), abs(world_bounds[1]))
+            ax_world.imshow(
+                food[t].T,                              # transpose so x→column, y→row align
+                origin="lower",
+                extent=(-half, half, -half, half),
+                cmap="YlGn", vmin=0.0, vmax=float(food.max() + 1e-6),
+                alpha=0.45, zorder=-1, interpolation="bilinear",
+            )
+
+        # Draw obstacles as static grey discs underneath everything else.
+        if obstacles is not None and len(obstacles[1]) > 0:
+            centers, radii = obstacles
+            from matplotlib.patches import Circle
+            for cx_y, r in zip(centers, radii):
+                ax_world.add_patch(Circle(cx_y, float(r), facecolor="lightgray",
+                                          edgecolor="dimgray", linewidth=0.8, alpha=0.85, zorder=0))
 
         pred_alive_now = [i for i in predator_idx if alive[t, i]]
         prey_alive_now = [i for i in prey_idx if alive[t, i]]
@@ -450,13 +488,15 @@ def make_video(
                 try:
                     positions, alive, agent_names = _load_pos_alive_names(f)
                     genome = _load_genome(f)
+                    obstacles = _load_obstacles(f)
+                    food = _load_food(f)
                     _render_episode_ecosystem(
                         positions, alive, agent_names, writer,
                         pop_pred_global=pop_pred_global,
                         pop_prey_global=pop_prey_global,
                         cumulative_offset=ep_offsets[idx - 1] if ep_offsets else 0,
                         title_prefix=title, dpi=dpi, frameskip=frameskip, trail=trail,
-                        genome=genome,
+                        genome=genome, obstacles=obstacles, food=food,
                     )
                 except ValueError as e:
                     print(f"Skipping {f} for ecosystem replay: {e}")

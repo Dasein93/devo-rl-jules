@@ -234,6 +234,8 @@ class TrajectoryRecorder:
         self.step_pos: list = []   # list of per-step (A, 2) arrays
         self.step_alive: list = []  # list of per-step (A,) bool arrays — True when agent was alive
         self.step_genome: list = []  # list of per-step (A, G) arrays, only for ecosystem
+        self.step_food: list = []   # list of per-step (G, G) food grids, only for ecosystem
+        self.episode_obstacles: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (centers, radii) for the current episode
         self.buffer: list = []     # JSONL records
 
         self.env_id = env_id
@@ -249,6 +251,15 @@ class TrajectoryRecorder:
         elif v.size > target_len:
             v = v[:target_len]
         return v
+
+    def record_obstacles(self, centers: np.ndarray, radii: np.ndarray):
+        """Cache the obstacle layout for the current episode; written to npz on save()."""
+        self.episode_obstacles = (np.asarray(centers, dtype=np.float32),
+                                  np.asarray(radii, dtype=np.float32))
+
+    def record_food(self, food_grid: np.ndarray):
+        """Append the current food grid (G, G). Append-only — call once per recorded step."""
+        self.step_food.append(np.asarray(food_grid, dtype=np.float32).copy())
 
     def record_step(self, t, obs_dict, acts_dict, rewards_dict, done_any, infos, genome_by_agent=None):
         # Per-agent JSONL records — only for currently-alive agents (those in obs_dict).
@@ -327,6 +338,11 @@ class TrajectoryRecorder:
             payload["pos"] = np.stack(self.step_pos, axis=0).astype(np.float32)  # (T, A, 2)
         if self.step_genome:
             payload["genome"] = np.stack(self.step_genome, axis=0).astype(np.float32)  # (T, A, G)
+        if self.episode_obstacles is not None and len(self.episode_obstacles[1]) > 0:
+            payload["obstacles_centers"] = self.episode_obstacles[0]   # (M, 2)
+            payload["obstacles_radii"] = self.episode_obstacles[1]      # (M,)
+        if self.step_food:
+            payload["food"] = np.stack(self.step_food, axis=0).astype(np.float32)  # (T, G, G)
 
         np.savez_compressed(f"{path_base}.npz", **payload)
 
@@ -336,6 +352,8 @@ class TrajectoryRecorder:
         self.step_pos.clear()
         self.step_alive.clear()
         self.step_genome.clear()
+        self.step_food.clear()
+        self.episode_obstacles = None
 
     def save_manifest(self):
         agent_roles = ["predator" if "adversary" in name else "prey" for name in self.agent_names]
