@@ -406,6 +406,8 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
                     }
                 recorder.record_step(t, obs, acts, rewards, done_any, infos,
                                      genome_by_agent=genome_by_agent)
+                if env_id == "ecosystem" and hasattr(env, "_food"):
+                    recorder.record_food(env._food)
 
             obs = next_obs
             t += 1
