@@ -21,7 +21,8 @@ from train.ecosystem_env import make_ecosystem_env
 
 
 def make_env(env_id: str = "mpe.simple_tag_v3", n_predators: int = 2, n_prey: int = 2,
-             max_cycles: int = 200, seed: int = 42, ecosystem_overrides: Optional[dict] = None):
+             max_cycles: int = 200, seed: int = 42, ecosystem_overrides: Optional[dict] = None,
+             num_obstacles: int = 0):
     """Factory dispatching on env.id. Returns a PettingZoo-parallel-API compatible env."""
     if env_id == "ecosystem":
         overrides = dict(ecosystem_overrides or {})
@@ -35,7 +36,7 @@ def make_env(env_id: str = "mpe.simple_tag_v3", n_predators: int = 2, n_prey: in
     env = simple_tag_v3.parallel_env(
         num_adversaries=n_predators,
         num_good=n_prey,
-        num_obstacles=0,
+        num_obstacles=num_obstacles,
         max_cycles=max_cycles,
         continuous_actions=False,
         render_mode=None,
@@ -191,9 +192,11 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
 
     env_id = env_cfg.get("id", "mpe.simple_tag_v3")
     ecosystem_overrides = dict(env_cfg.get("ecosystem", {}) or {})
+    num_obstacles = int(env_cfg.get("num_obstacles", 0))
     env = make_env(env_id=env_id, n_predators=n_pred, n_prey=n_prey,
                    max_cycles=max_steps, seed=seed,
-                   ecosystem_overrides=ecosystem_overrides)
+                   ecosystem_overrides=ecosystem_overrides,
+                   num_obstacles=num_obstacles)
     obs0 = _reset(env, seed=seed)
     # Use possible_agents when the env exposes it (ecosystem env's full slot
     # roster includes "ghost" agents that may be born mid-episode). Fall back
@@ -253,6 +256,7 @@ def main(cfg_path, override_eps=None, save_dir=None, device=None, resume_from=No
         traj_dir = os.path.join(out_dir, "traj"); ensure_dir(traj_dir)
         env_record_cfg = {
             "num_adversaries": n_pred, "num_good": n_prey,
+            "num_obstacles": num_obstacles,
             "max_cycles": max_steps, "continuous_actions": False,
         }
         recorder = TrajectoryRecorder(
