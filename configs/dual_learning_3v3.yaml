@@ -1,0 +1,41 @@
+seed: 42
+device: cpu
+
+env:
+  id: mpe.simple_tag_v3
+  max_steps: 300
+  n_predators: 3
+  n_prey: 3
+
+train:
+  algo: ppo
+  total_episodes: 600
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  minibatch_size: 1024
+  update_epochs: 4
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128
+  centralized_critic: true
+
+league:
+  enabled: true
+  snapshot_every: 25
+  opponent_prob: 0.3
+  max_snapshots: 20
+
+logging:
+  save_dir: artifacts/
+  plot_every: 50
+
+checkpoint:
+  enabled: true
+  every: 100
+
+recording:
+  enabled: true
+  sample_rate: 1
