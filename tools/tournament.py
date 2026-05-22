@@ -127,10 +127,13 @@ def run_tournament(run_dir: str, episodes: int, out_dir: str, config_path: str,
     os.makedirs(out_dir, exist_ok=True)
 
     env = make_env(
+        env_id=env_cfg.get("id", "mpe.simple_tag_v3"),
         n_predators=int(env_cfg.get("n_predators", 2)),
         n_prey=int(env_cfg.get("n_prey", 2)),
         max_cycles=int(env_cfg.get("max_steps", 200)),
         seed=seed,
+        ecosystem_overrides=dict(env_cfg.get("ecosystem", {}) or {}),
+        num_obstacles=int(env_cfg.get("num_obstacles", 0)),
     )
     obs0 = _reset(env, seed=seed)
     agents = sorted(obs0.keys())
